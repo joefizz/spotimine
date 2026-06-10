@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.env
+
+# Downloaded audio files
+songs/
+
+# Generated chart reports
+static/reports/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,10 @@
+services:
+  spotimine:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      # Downloaded songs and generated charts persist across restarts
+      - ./songs:/app/songs
+      - ./static/reports:/app/static/reports
+    restart: unless-stopped

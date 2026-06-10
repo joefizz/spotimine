@@ -1,0 +1,6 @@
+flask
+spotdl
+librosa
+matplotlib
+numpy
+soundfile
