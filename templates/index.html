@@ -1211,10 +1211,7 @@ function renderBuilderList() {
   const pl = playlists.find(p => p.id === currentPlId);
 
   if (!pl) {
-    listEl.innerHTML = '';
-    listEl.appendChild(emptyEl);
-    emptyEl.innerHTML = '<strong>No playlist selected</strong><p>Create or select a playlist above, then click <strong>+ Class</strong> on any song to add it here.</p>';
-    emptyEl.style.display = '';
+    listEl.innerHTML = '<div class="empty-state"><strong>No playlist selected</strong><p>Create or select a playlist above, then click <strong>+ Class</strong> on any song to add it here.</p></div>';
     barEl.style.display = 'none';
     countEl.textContent = '0 tracks';
     delBtn.disabled = true;
@@ -1226,15 +1223,11 @@ function renderBuilderList() {
   countEl.textContent = `${tracks.length} track${tracks.length !== 1 ? 's' : ''}`;
 
   if (!tracks.length) {
-    listEl.innerHTML = '';
-    emptyEl.innerHTML = '<strong>Playlist is empty</strong><p>Click <strong>+ Class</strong> on any song in the Songs Library to add it here.</p>';
-    listEl.appendChild(emptyEl);
-    emptyEl.style.display = '';
+    listEl.innerHTML = '<div class="empty-state"><strong>Playlist is empty</strong><p>Click <strong>+ Class</strong> on any song in the Songs Library to add it here.</p></div>';
     barEl.style.display = 'none';
     return;
   }
 
-  emptyEl.style.display = 'none';
   barEl.style.display   = 'flex';
 
   let totalSec = 0;
