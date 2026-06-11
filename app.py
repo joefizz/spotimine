@@ -394,7 +394,41 @@ def export_playlist(pl_id: str):
             headers={"Content-Disposition": f'attachment; filename="{pl["name"]}.md"'},
         )
 
+    if fmt == "csv":
+        csv = _build_csv(summary, tracks_out)
+        return Response(
+            csv,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{pl["name"]}.csv"'},
+        )
+
     return jsonify({"error": "unknown format"}), 400
+
+
+def _build_csv(summary: dict, tracks: list) -> str:
+    """Build CSV for Spotlistr or other Spotify playlist import tools."""
+    import csv
+    from io import StringIO
+
+    output = StringIO()
+    writer = csv.DictWriter(output, fieldnames=["Track Name", "Artist Name", "Album Name", "BPM", "Key"])
+    writer.writeheader()
+
+    for t in tracks:
+        # Try to extract artist name from the track name (usually "Artist - Track Name" format)
+        name_parts = t["name"].split(" - ")
+        artist = name_parts[0] if len(name_parts) > 1 else ""
+        track_name = name_parts[-1] if len(name_parts) > 1 else t["name"]
+
+        writer.writerow({
+            "Track Name": track_name.strip(),
+            "Artist Name": artist.strip(),
+            "Album Name": "",
+            "BPM": t["bpm"] or "",
+            "Key": t["key"] or "",
+        })
+
+    return output.getvalue()
 
 
 def _build_markdown(summary: dict, tracks: list) -> str:

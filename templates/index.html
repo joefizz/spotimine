@@ -304,8 +304,9 @@
         <div class="export-bar" id="export-bar" style="display:none">
           <span class="pl-stats" id="pl-stats"></span>
           <div class="export-btns">
+            <button class="btn-export" onclick="exportPlaylist('csv')">⬇ CSV (for Spotify)</button>
             <button class="btn-export" onclick="exportPlaylist('json')">⬇ JSON</button>
-            <button class="btn-export" onclick="exportPlaylist('markdown')">⬇ Markdown (for Claude)</button>
+            <button class="btn-export" onclick="exportPlaylist('markdown')">⬇ Markdown</button>
           </div>
         </div>
       </section>
@@ -675,6 +676,12 @@ let currentES = null;
 function startAnalysis() {
   const url = document.getElementById('url-input').value.trim();
   if (!url) return;
+
+  // Show confirmation dialog
+  if (!confirm('Start analyzing this URL? This may take several minutes for large playlists. Continue?')) {
+    return;
+  }
+
   const btn = document.getElementById('analyze-btn');
   btn.disabled = true;
   clearLog();
