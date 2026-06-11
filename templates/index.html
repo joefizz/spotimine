@@ -167,6 +167,10 @@
   a.ctrl-dl { background:transparent; border:1px solid var(--surf2); color:var(--teal); font-size:.78rem; padding:.32rem .75rem; text-decoration:none; border-radius:6px; white-space:nowrap; }
   a.ctrl-dl:hover { border-color:var(--teal); }
 
+  /* ── playhead tooltip ── */
+  .playhead-tooltip { position:absolute; background:rgba(0,0,0,.85); color:var(--text); padding:.25rem .5rem; border-radius:4px; font-size:.75rem; font-weight:700; font-family:monospace; pointer-events:none; white-space:nowrap; display:none; z-index:10; }
+  .playhead-tooltip.visible { display:block; }
+
   /* ── Class Builder ── */
   .btn-add { background:transparent; border:1px solid var(--teal); color:var(--teal); font-size:.78rem; font-weight:700; padding:.28rem .55rem; border-radius:5px; }
   .btn-add:hover { background:rgba(78,205,196,.15); }
@@ -335,6 +339,7 @@
       <img id="player-img" src="" alt="" style="display:none">
       <canvas id="playhead" style="display:none"></canvas>
       <span class="no-chart-msg" id="no-chart-msg" style="display:none">No analysis chart — audio only</span>
+      <div class="playhead-tooltip" id="playhead-tooltip"></div>
     </div>
     <div class="controls">
       <button class="ctrl-play" id="play-btn" onclick="togglePlay()" disabled>▶</button>
@@ -990,6 +995,46 @@ document.getElementById('playhead').addEventListener('click', e => {
   updateScrub(audio.currentTime);
 });
 
+// Tooltip on chart hover
+document.getElementById('chart-area').addEventListener('mousemove', e => {
+  const dur = player.duration || audio.duration;
+  if (!dur || !player.hasChart) return;
+
+  const area = document.getElementById('chart-area');
+  const img = document.getElementById('player-img');
+  const tooltip = document.getElementById('playhead-tooltip');
+
+  if (!img.complete || !img.naturalWidth) return;
+
+  const areaRect = area.getBoundingClientRect();
+  const imgRect = img.getBoundingClientRect();
+
+  const relX = (e.clientX - imgRect.left) / imgRect.width;
+
+  // Only show tooltip if hovering over the chart area (within data bounds)
+  if (relX < player.cl || relX > player.cr) {
+    tooltip.classList.remove('visible');
+    return;
+  }
+
+  // Calculate the timestamp based on position
+  const timePercent = (relX - player.cl) / (player.cr - player.cl);
+  const time = timePercent * dur;
+
+  tooltip.textContent = fmtTime(time);
+  tooltip.classList.add('visible');
+
+  // Position tooltip
+  const tooltipX = e.clientX - areaRect.left;
+  const tooltipY = e.clientY - areaRect.top - 30;
+  tooltip.style.left = `${tooltipX}px`;
+  tooltip.style.top = `${tooltipY}px`;
+});
+
+document.getElementById('chart-area').addEventListener('mouseleave', () => {
+  document.getElementById('playhead-tooltip').classList.remove('visible');
+});
+
 // Seek via scrub bar
 document.getElementById('scrub').addEventListener('click', e => {
   const dur = player.duration || audio.duration;
@@ -1089,7 +1134,8 @@ async function addToPlaylist(audioFile) {
   }
   pl.tracks.push({file: audioFile, notes: ''});
   await _saveCurrent();
-  renderBuilderList();
+  // Re-sync the dropdown selector and builder list to ensure everything is in sync
+  renderPlaylistSelector();
   // Scroll to builder
   document.getElementById('builder-section').scrollIntoView({behavior:'smooth', block:'start'});
 }
