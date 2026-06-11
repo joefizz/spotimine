@@ -27,7 +27,13 @@
   header h1 span { color:var(--accent); }
   header p { color:var(--muted); font-size:.88rem; margin-top:3px; }
 
-  main { max-width:1400px; margin:0 auto; padding:2rem; }
+  main { max-width:1400px; margin:0 auto; padding:2rem; display:flex; flex-direction:column; }
+
+  .main-content { display:flex; gap:0; position:relative; }
+  .main-left { flex:1; min-width:0; padding-right:1.5rem; }
+  .main-right { width:15%; min-width:320px; padding-left:1.5rem; }
+  .resize-divider { width:1px; background:var(--surf2); cursor:col-resize; transition:background .15s; user-select:none; }
+  .resize-divider:hover { background:var(--accent); width:2px; }
 
   /* ── form card ── */
   .card-wrap { background:var(--surf); border:1px solid var(--surf2); border-radius:var(--r); padding:1.5rem 2rem; margin-bottom:2rem; }
@@ -59,6 +65,9 @@
   /* ── section headers ── */
   .sec-head { display:flex; align-items:center; gap:.75rem; margin-bottom:1.2rem; flex-wrap:wrap; }
   .sec-head h2 { font-size:1.1rem; font-weight:700; }
+  .main-right .sec-head { flex-direction:column; align-items:flex-start; }
+  .main-right .sec-head h2 { font-size:1rem; }
+  .main-right .badge { align-self:flex-start; }
   .badge { background:var(--surf2); border-radius:20px; padding:2px 10px; font-size:.78rem; color:var(--muted); }
   .btn-ghost { background:transparent; border:1px solid var(--surf2); color:var(--muted); padding:.38rem .9rem; font-size:.78rem; font-weight:600; margin-left:auto; }
   .btn-ghost:hover { border-color:var(--accent); color:var(--accent); background:transparent; }
@@ -68,7 +77,11 @@
   /* ── songs table ── */
   section { margin-bottom:2.5rem; }
   .songs-table { width:100%; border-collapse:collapse; }
-  .songs-table th { text-align:left; font-size:.74rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; padding:.6rem .9rem; border-bottom:1px solid var(--surf2); white-space:nowrap; }
+  .songs-table th { text-align:left; font-size:.74rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; padding:.6rem .9rem; border-bottom:1px solid var(--surf2); white-space:nowrap; cursor:pointer; user-select:none; transition:color .15s; }
+  .songs-table th:hover { color:var(--accent); }
+  .songs-table th.active { color:var(--accent); }
+  .sort-indicator { font-size:.65rem; opacity:0; transition:opacity .15s; }
+  .songs-table th.active .sort-indicator { opacity:1; }
   .songs-table td { padding:.6rem .9rem; border-bottom:1px solid #1e2a40; font-size:.87rem; vertical-align:middle; }
   .songs-table tr:hover td { background:rgba(255,255,255,.02); }
   .song-name { font-weight:600; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -157,14 +170,15 @@
   /* ── Class Builder ── */
   .btn-add { background:transparent; border:1px solid var(--teal); color:var(--teal); font-size:.78rem; font-weight:700; padding:.28rem .55rem; border-radius:5px; }
   .btn-add:hover { background:rgba(78,205,196,.15); }
-  .builder-controls { display:flex; flex-wrap:wrap; align-items:center; gap:.6rem; margin-bottom:1.1rem; }
-  .pl-select { background:var(--bg); border:1px solid var(--surf2); border-radius:6px; padding:.55rem .8rem; color:var(--text); font-size:.88rem; outline:none; min-width:200px; cursor:pointer; }
+  .builder-controls { display:flex; flex-direction:column; gap:.6rem; margin-bottom:1.1rem; }
+  .pl-select { background:var(--bg); border:1px solid var(--surf2); border-radius:6px; padding:.55rem .8rem; color:var(--text); font-size:.88rem; outline:none; width:100%; cursor:pointer; }
   .pl-select:focus { border-color:var(--accent); }
-  .pl-name-input { background:var(--bg); border:1px solid var(--surf2); border-radius:6px; padding:.55rem .8rem; color:var(--text); font-size:.88rem; outline:none; width:210px; }
+  .pl-name-input { background:var(--bg); border:1px solid var(--surf2); border-radius:6px; padding:.55rem .8rem; color:var(--text); font-size:.88rem; outline:none; width:100%; }
   .pl-name-input:focus { border-color:var(--accent); }
   .pl-name-input::placeholder { color:var(--muted); }
 
   .builder-track-list { min-height:80px; }
+  .main-right .builder-track-list { max-height:calc(100vh - 500px); overflow-y:auto; }
   .builder-track {
     display:flex; align-items:center; gap:.65rem;
     background:var(--surf); border:1px solid var(--surf2); border-radius:8px;
@@ -184,10 +198,10 @@
   .track-notes:focus { border-color:var(--surf2); color:var(--text); }
   .track-notes::placeholder { color:#4a5a6a; }
 
-  .export-bar { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:.75rem; padding:.85rem 0 0; border-top:1px solid var(--surf2); margin-top:.5rem; }
+  .export-bar { display:flex; flex-direction:column; gap:.75rem; padding:.85rem 0 0; border-top:1px solid var(--surf2); margin-top:.5rem; }
   .pl-stats { font-size:.83rem; color:var(--muted); }
-  .export-btns { display:flex; gap:.5rem; }
-  .btn-export { background:var(--surf2); color:var(--text); padding:.42rem .9rem; font-size:.82rem; font-weight:700; border-radius:6px; }
+  .export-btns { display:flex; flex-direction:column; gap:.5rem; }
+  .btn-export { background:var(--surf2); color:var(--text); padding:.42rem .9rem; font-size:.82rem; font-weight:700; border-radius:6px; width:100%; }
   .btn-export:hover { background:#1a3a70; }
 </style>
 </head>
@@ -216,71 +230,81 @@
     <div class="log-panel" id="log-panel"></div>
   </div>
 
-  <!-- Songs Library -->
-  <section id="songs-section">
-    <div class="sec-head">
-      <h2>Songs Library</h2>
-      <span class="badge" id="songs-count">0</span>
-      <button class="btn-danger" onclick="confirmPurge()">Purge All</button>
-    </div>
-    <table class="songs-table">
-      <thead>
-        <tr>
-          <th>Song</th>
-          <th>BPM</th>
-          <th>Key</th>
-          <th>Duration</th>
-          <th>Tags</th>
-          <th>Class</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody id="songs-tbody">
-        <tr class="empty-row"><td colspan="6">No songs downloaded yet.</td></tr>
-      </tbody>
-    </table>
-  </section>
+  <div class="main-content" id="main-content">
 
-  <!-- Analysis Reports -->
-  <section id="charts-section">
-    <div class="sec-head">
-      <h2>Analysis Reports</h2>
-      <span class="badge" id="chart-count">0</span>
-    </div>
-    <div id="chart-grid"></div>
-  </section>
+    <div class="main-left" id="main-left">
+      <!-- Songs Library -->
+      <section id="songs-section">
+        <div class="sec-head">
+          <h2>Songs Library</h2>
+          <span class="badge" id="songs-count">0</span>
+          <button class="btn-danger" onclick="confirmPurge()">Purge All</button>
+        </div>
+        <table class="songs-table">
+          <thead>
+            <tr>
+              <th onclick="toggleSort('name')">Song <span class="sort-indicator"></span></th>
+              <th onclick="toggleSort('tempo')">BPM <span class="sort-indicator"></span></th>
+              <th onclick="toggleSort('key')">Key <span class="sort-indicator"></span></th>
+              <th onclick="toggleSort('duration')">Duration <span class="sort-indicator"></span></th>
+              <th>Tags</th>
+              <th>Class</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="songs-tbody">
+            <tr class="empty-row"><td colspan="6">No songs downloaded yet.</td></tr>
+          </tbody>
+        </table>
+      </section>
 
-  <!-- Class Builder -->
-  <section id="builder-section">
-    <div class="sec-head">
-      <h2>Class Builder</h2>
-      <span class="badge" id="builder-track-count">0 tracks</span>
+      <!-- Analysis Reports -->
+      <section id="charts-section">
+        <div class="sec-head">
+          <h2>Analysis Reports</h2>
+          <span class="badge" id="chart-count">0</span>
+        </div>
+        <div id="chart-grid"></div>
+      </section>
     </div>
 
-    <div class="builder-controls">
-      <select id="pl-select" class="pl-select" onchange="onPlaylistSelect()">
-        <option value="">— select a playlist —</option>
-      </select>
-      <input id="new-pl-name" class="pl-name-input" type="text" placeholder="New playlist name…">
-      <button onclick="createPlaylist()">+ Create</button>
-      <button class="btn-danger" id="delete-pl-btn" disabled onclick="deleteCurrentPlaylist()" style="margin-left:auto">Delete</button>
+    <div class="resize-divider" id="resize-divider"></div>
+
+    <div class="main-right" id="main-right">
+      <!-- Class Builder -->
+      <section id="builder-section">
+        <div class="sec-head">
+          <h2>Class Builder</h2>
+          <span class="badge" id="builder-track-count">0 tracks</span>
+        </div>
+
+        <div class="builder-controls">
+          <select id="pl-select" class="pl-select" onchange="onPlaylistSelect()">
+            <option value="">— select a playlist —</option>
+          </select>
+          <input id="new-pl-name" class="pl-name-input" type="text" placeholder="New playlist name…">
+          <button onclick="createPlaylist()" style="width:100%">+ Create</button>
+          <button class="btn-danger" id="delete-pl-btn" disabled onclick="deleteCurrentPlaylist()" style="width:100%">Delete</button>
+        </div>
+
+        <div id="builder-track-list">
+          <div class="empty-state" id="builder-empty">
+            <strong>No playlist selected</strong>
+            <p>Create or select a playlist above, then click <strong>+</strong> on any song to add it here.</p>
+          </div>
+        </div>
+
+        <div class="export-bar" id="export-bar" style="display:none">
+          <span class="pl-stats" id="pl-stats"></span>
+          <div class="export-btns">
+            <button class="btn-export" onclick="exportPlaylist('json')">⬇ JSON</button>
+            <button class="btn-export" onclick="exportPlaylist('markdown')">⬇ Markdown (for Claude)</button>
+          </div>
+        </div>
+      </section>
     </div>
 
-    <div id="builder-track-list">
-      <div class="empty-state" id="builder-empty">
-        <strong>No playlist selected</strong>
-        <p>Create or select a playlist above, then click <strong>+</strong> on any song to add it here.</p>
-      </div>
-    </div>
-
-    <div class="export-bar" id="export-bar" style="display:none">
-      <span class="pl-stats" id="pl-stats"></span>
-      <div class="export-btns">
-        <button class="btn-export" onclick="exportPlaylist('json')">⬇ JSON</button>
-        <button class="btn-export" onclick="exportPlaylist('markdown')">⬇ Markdown (for Claude)</button>
-      </div>
-    </div>
-  </section>
+  </div>
 
 </main>
 
@@ -353,6 +377,7 @@ let allSongs  = [];
 let allCharts = [];
 let player = { duration: 0, hasChart: false, hasAudio: false, raf: null, cl: CL, cr: CR, cyt: CYT, cyb: CYB };
 let tagState  = { songFile: null, activeTags: [] };
+let sortState = { column: null, ascending: true };
 const audio   = document.getElementById('audio');
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
@@ -374,6 +399,24 @@ async function loadAll() {
 }
 
 // ── Songs library ─────────────────────────────────────────────────────────────
+function sortSongs(songs, column, ascending) {
+  const sorted = [...songs];
+  sorted.sort((a, b) => {
+    let aVal, bVal;
+    switch (column) {
+      case 'name': aVal = a.name.toLowerCase(); bVal = b.name.toLowerCase(); break;
+      case 'tempo': aVal = a.tempo || 0; bVal = b.tempo || 0; break;
+      case 'key': aVal = (a.key || '').toLowerCase(); bVal = (b.key || '').toLowerCase(); break;
+      case 'duration': aVal = a.duration || 0; bVal = b.duration || 0; break;
+      default: return 0;
+    }
+    if (aVal < bVal) return ascending ? -1 : 1;
+    if (aVal > bVal) return ascending ? 1 : -1;
+    return 0;
+  });
+  return sorted;
+}
+
 function renderSongs(songs) {
   const tbody = document.getElementById('songs-tbody');
   document.getElementById('songs-count').textContent = songs.length;
@@ -381,7 +424,14 @@ function renderSongs(songs) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No songs downloaded yet.</td></tr>';
     return;
   }
-  tbody.innerHTML = songs.map(s => `
+
+  // Apply current sort
+  let displaySongs = songs;
+  if (sortState.column) {
+    displaySongs = sortSongs(songs, sortState.column, sortState.ascending);
+  }
+
+  tbody.innerHTML = displaySongs.map(s => `
     <tr data-file="${esc(s.file)}">
       <td class="song-name" title="${esc(s.name)}">${esc(s.name)}</td>
       <td class="cell-muted">${s.tempo ? s.tempo.toFixed(1) : '—'}</td>
@@ -391,12 +441,12 @@ function renderSongs(songs) {
         <div class="tags-cell" id="tags-${esc(s.file)}">
           ${renderTagChips(s.tags || [])}
           <button class="tag-edit-btn"
-            onclick="openTagEditor(event,'${esc(s.file)}','${esc(s.name)}')"
+            onclick="openTagEditor(event,'${jsEsc(s.file)}','${jsEsc(s.name)}')"
             title="Edit tags">＋ tag</button>
         </div>
       </td>
       <td>
-        <button class="btn-sm btn-add" onclick="addToPlaylist('${esc(s.file)}')" title="Add to class playlist">+ Class</button>
+        <button class="btn-sm btn-add" onclick="addToPlaylist('${jsEsc(s.file)}')" title="Add to class playlist">+ Class</button>
       </td>
       <td class="cell-actions">
         <button class="btn-sm btn-play"
@@ -409,7 +459,7 @@ function renderSongs(songs) {
           href="/songs/download/${encodeURIComponent(s.file)}"
           download="${esc(s.file)}">⬇</a>
         <button class="btn-sm btn-del"
-          onclick="deleteSong('${esc(s.file)}')">✕</button>
+          onclick="deleteSong('${jsEsc(s.file)}')">✕</button>
       </td>
     </tr>
   `).join('');
@@ -419,6 +469,33 @@ function renderTagChips(tags) {
   return tags.map(t =>
     `<span class="tag-chip" style="${tagStyle(t)}">${esc(t)}</span>`
   ).join('');
+}
+
+function toggleSort(column) {
+  // Toggle direction if same column, otherwise switch to new column ascending
+  if (sortState.column === column) {
+    sortState.ascending = !sortState.ascending;
+  } else {
+    sortState.column = column;
+    sortState.ascending = true;
+  }
+
+  // Update header styles
+  document.querySelectorAll('.songs-table th').forEach(th => {
+    th.classList.remove('active');
+    const indicator = th.querySelector('.sort-indicator');
+    if (indicator) indicator.textContent = '';
+  });
+
+  const headers = document.querySelectorAll('.songs-table th');
+  const columnIndex = { 'name': 0, 'tempo': 1, 'key': 2, 'duration': 3 }[column];
+  if (columnIndex !== undefined && headers[columnIndex]) {
+    headers[columnIndex].classList.add('active');
+    const indicator = headers[columnIndex].querySelector('.sort-indicator');
+    if (indicator) indicator.textContent = sortState.ascending ? '▲' : '▼';
+  }
+
+  renderSongs(allSongs);
 }
 
 function openPlayerFromEl(btn) {
@@ -452,7 +529,7 @@ function openTagEditor(event, songFile, songName) {
     <span class="preset-chip"
       style="background:${t.bg};color:${t.color};"
       data-label="${esc(t.label)}"
-      onclick="togglePresetTag(this,'${esc(t.label)}')">${esc(t.label)}</span>
+      onclick="togglePresetTag(this,'${jsEsc(t.label)}')">${esc(t.label)}</span>
   `).join('');
 
   // Mark active presets
@@ -504,7 +581,7 @@ async function saveAndCloseTags() {
   const cell = document.getElementById(`tags-${file}`);
   if (cell) {
     cell.innerHTML = renderTagChips(tagState.activeTags) +
-      `<button class="tag-edit-btn" onclick="openTagEditor(event,'${esc(file)}','${esc(song?.name||'')}')" title="Edit tags">＋ tag</button>`;
+      `<button class="tag-edit-btn" onclick="openTagEditor(event,'${jsEsc(file)}','${jsEsc(song?.name||'')}')" title="Edit tags">＋ tag</button>`;
   }
   closeTagEditor();
 }
@@ -945,6 +1022,9 @@ function fmtTime(s) {
 function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
+function jsEsc(s) {
+  return String(s||'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'\\"').replace(/\n/g,'\\n').replace(/\r/g,'\\r');
+}
 
 // ── Class Builder ─────────────────────────────────────────────────────────────
 let playlists = [];
@@ -1033,11 +1113,18 @@ async function updateTrackNotes(audioFile, notes) {
 async function _saveCurrent() {
   const pl = playlists.find(p => p.id === currentPlId);
   if (!pl) return;
-  await fetch(`/playlists/${currentPlId}`, {
-    method: 'PUT',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({name: pl.name, tracks: pl.tracks}),
-  });
+  try {
+    const resp = await fetch(`/playlists/${currentPlId}`, {
+      method: 'PUT',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({name: pl.name, tracks: pl.tracks}),
+    });
+    if (!resp.ok) {
+      console.error(`Failed to save playlist: ${resp.status} ${resp.statusText}`);
+    }
+  } catch (err) {
+    console.error('Playlist save error:', err);
+  }
 }
 
 function renderBuilderList() {
@@ -1099,9 +1186,9 @@ function renderBuilderList() {
       <div class="track-tags">${tags.map(tg => `<span class="tag-chip" style="${tagStyle(tg)}">${esc(tg)}</span>`).join('')}</div>
       <input class="track-notes" type="text" placeholder="Instructor notes…"
              value="${esc(t.notes || '')}"
-             onchange="updateTrackNotes('${esc(t.file)}', this.value)"
+             onchange="updateTrackNotes('${jsEsc(t.file)}', this.value)"
              onclick="event.stopPropagation()">
-      <button class="btn-sm btn-del" onclick="removeFromPlaylist('${esc(t.file)}')">✕</button>
+      <button class="btn-sm btn-del" onclick="removeFromPlaylist('${jsEsc(t.file)}')">✕</button>
     </div>`;
   }).join('');
 
@@ -1169,6 +1256,52 @@ function exportPlaylist(fmt) {
   if (!currentPlId) { alert('Select a playlist first.'); return; }
   window.open(`/playlists/${currentPlId}/export?format=${fmt}`, '_blank');
 }
+
+// ── Dynamic column resize ─────────────────────────────────────────────────────
+const divider = document.getElementById('resize-divider');
+const container = document.getElementById('main-content');
+const leftPanel = document.getElementById('main-left');
+const rightPanel = document.getElementById('main-right');
+
+// Load saved split ratio from localStorage
+const savedRatio = localStorage.getItem('layoutRatio');
+if (savedRatio) {
+  const ratio = parseFloat(savedRatio);
+  leftPanel.style.flex = `0 0 ${ratio}%`;
+  rightPanel.style.width = `${100 - ratio}%`;
+}
+
+let isResizing = false;
+
+divider.addEventListener('mousedown', () => {
+  isResizing = true;
+  document.body.style.userSelect = 'none';
+  document.body.style.cursor = 'col-resize';
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!isResizing) return;
+
+  const containerRect = container.getBoundingClientRect();
+  const newLeftWidth = e.clientX - containerRect.left;
+  const ratio = (newLeftWidth / containerRect.width) * 100;
+
+  // Clamp between 40% and 85%
+  const clampedRatio = Math.max(40, Math.min(85, ratio));
+  const rightWidth = 100 - clampedRatio;
+
+  leftPanel.style.flex = `0 0 ${clampedRatio}%`;
+  rightPanel.style.width = `${rightWidth}%`;
+
+  // Save to localStorage
+  localStorage.setItem('layoutRatio', clampedRatio.toString());
+});
+
+document.addEventListener('mouseup', () => {
+  isResizing = false;
+  document.body.style.userSelect = '';
+  document.body.style.cursor = '';
+});
 </script>
 </body>
 </html>
