@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import warnings
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -47,11 +48,47 @@ def _ensure_ffmpeg(log: LogFn):
     log("ffmpeg installed.")
 
 
+def _read_analyzed_tracks(reports_dir: Path) -> dict:
+    """Load the set of already-analyzed track filenames."""
+    analyzed_file = reports_dir / "analyzed_tracks.json"
+    if analyzed_file.exists():
+        try:
+            return json.loads(analyzed_file.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _write_analyzed_tracks(reports_dir: Path, analyzed: dict):
+    """Save the set of analyzed track filenames."""
+    analyzed_file = reports_dir / "analyzed_tracks.json"
+    analyzed_file.write_text(json.dumps(analyzed, indent=2), encoding="utf-8")
+
+
+def _mark_analyzed(reports_dir: Path, filename: str, metadata: dict):
+    """Record that a track has been analyzed."""
+    analyzed = _read_analyzed_tracks(reports_dir)
+    analyzed[filename] = {
+        "analyzed_at": datetime.now().isoformat(),
+        "tempo": metadata.get("tempo"),
+        "key": metadata.get("key"),
+        "duration": metadata.get("duration"),
+        "name": metadata.get("name"),
+    }
+    _write_analyzed_tracks(reports_dir, analyzed)
+
+
 def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[Path]:
     """Download all tracks from a Spotify playlist URL using spotdl."""
     _ensure_ffmpeg(log)
     download_dir.mkdir(parents=True, exist_ok=True)
     log(f"Starting download → {download_dir}")
+
+    # Track which files existed before download
+    existing_files = set(
+        p for p in download_dir.iterdir()
+        if p.suffix.lower() in {".mp3", ".m4a", ".opus", ".flac", ".wav"}
+    ) if download_dir.exists() else set()
 
     process = subprocess.Popen(
         ["spotdl", url, "--output", str(download_dir)],
@@ -66,12 +103,15 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             log(line)
     process.wait()
 
-    audio_files = sorted(
+    # Only return newly downloaded files
+    all_audio_files = sorted(
         p for p in download_dir.iterdir()
         if p.suffix.lower() in {".mp3", ".m4a", ".opus", ".flac", ".wav"}
     )
-    log(f"Found {len(audio_files)} audio file(s).")
-    return audio_files
+    new_audio_files = [f for f in all_audio_files if f not in existing_files]
+
+    log(f"Found {len(new_audio_files)} new audio file(s).")
+    return new_audio_files
 
 
 def analyze_track(path: Path) -> dict:
@@ -327,13 +367,25 @@ def run_analysis(url: str, songs_dir: Path, reports_dir: Path, log: LogFn = prin
         log("No audio files found after download.")
         return
 
-    log(f"\nAnalyzing {len(audio_files)} track(s) ...")
-    for path in audio_files:
+    analyzed = _read_analyzed_tracks(reports_dir)
+    new_tracks = [f for f in audio_files if f.name not in analyzed]
+    skip_count = len(audio_files) - len(new_tracks)
+
+    if skip_count > 0:
+        log(f"Skipping {skip_count} already-analyzed track(s).")
+
+    if not new_tracks:
+        log("All tracks already analyzed.")
+        return
+
+    log(f"\nAnalyzing {len(new_tracks)} new track(s) ...")
+    for path in new_tracks:
         log(f"  Analyzing: {path.name}")
         try:
             data = analyze_track(path)
             out = reports_dir / f"{_safe_name(data['name'])}.png"
             generate_chart(data, out)
+            _mark_analyzed(reports_dir, path.name, data)
             log(f"  ✓ {data['name']}  ({data['tempo']:.1f} BPM, key {data['key']})")
         except Exception as exc:
             log(f"  ✗ {path.name}: {exc}")
