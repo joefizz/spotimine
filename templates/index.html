@@ -63,6 +63,10 @@
   #cookie-text:focus { border-color:var(--accent); }
   #cookie-text::placeholder { color:#4a5a70; }
   .cookie-actions { display:flex; gap:.7rem; margin-top:.8rem; }
+  .slsk-grid { display:flex; gap:.7rem; flex-wrap:wrap; }
+  .slsk-grid input { flex:1; min-width:200px; background:var(--bg); border:1px solid var(--surf2); border-radius:6px; padding:.7rem .9rem; color:var(--text); font-size:.9rem; outline:none; }
+  .slsk-grid input:focus { border-color:var(--accent); }
+  .slsk-grid input::placeholder { color:var(--muted); }
 
   /* ── log ── */
   .log-panel { background:#0d0d1a; border:1px solid var(--surf2); border-radius:var(--r); padding:.9rem 1.1rem; margin-top:1rem; max-height:220px; overflow-y:auto; font-family:'Cascadia Code',Consolas,monospace; font-size:.8rem; line-height:1.65; display:none; }
@@ -281,6 +285,37 @@
     </div>
   </div>
 
+  <!-- Soulseek (second source) -->
+  <div class="card-wrap">
+    <div class="cookie-head">
+      <h2>Soulseek <span style="text-transform:none;letter-spacing:0">— second source</span></h2>
+      <span class="cookie-state unknown" id="slsk-state">
+        <span class="dot" id="slsk-dot"></span><span id="slsk-state-text">checking…</span>
+      </span>
+      <button class="btn-ghost" onclick="toggleSlskPanel()">Credentials</button>
+    </div>
+    <div class="cookie-body" id="slsk-body">
+      <p class="cookie-hint">
+        Used only for tracks YouTube Music cannot supply at 256 kbps — mostly
+        remixes and edits, which exist there only as 128 kbps video entries.
+        Files still have to pass verification, so the library's quality floor
+        does not drop. A Soulseek account is free and is created the first time
+        you sign in with an unused name; use one separate from any Soulseek
+        client you already run.
+      </p>
+      <div class="slsk-grid">
+        <input id="slsk-user" type="text" autocomplete="off" placeholder="Soulseek username">
+        <input id="slsk-pass" type="password" autocomplete="new-password" placeholder="Soulseek password">
+      </div>
+      <div class="cookie-actions">
+        <button id="slsk-save" onclick="saveSlskCredentials()">Save credentials</button>
+        <button class="btn-danger" id="slsk-clear" onclick="clearSlskCredentials()"
+                style="margin-left:0">Forget</button>
+      </div>
+      <div class="log-panel" id="slsk-log"></div>
+    </div>
+  </div>
+
   <div class="main-content" id="main-content">
 
     <div class="main-left" id="main-left">
@@ -434,7 +469,11 @@ let sortState = { column: null, ascending: true };
 const audio   = document.getElementById('audio');
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-window.addEventListener('load', () => { loadAll(); refreshCookieStatus(); });
+window.addEventListener('load', () => {
+  loadAll();
+  refreshCookieStatus();
+  refreshSlskStatus();
+});
 
 async function loadAll() {
   const [songs, charts, bounds] = await Promise.all([
@@ -859,6 +898,95 @@ async function checkPremium() {
     setCookieState('bad', 'probe failed');
   } finally {
     btn.disabled = false;
+  }
+}
+
+// ── Soulseek credentials ──────────────────────────────────────────────────────
+
+function toggleSlskPanel() {
+  document.getElementById('slsk-body').classList.toggle('open');
+}
+
+function setSlskState(cls, text) {
+  const el = document.getElementById('slsk-state');
+  el.className = 'cookie-state ' + cls;
+  document.getElementById('slsk-state-text').textContent = text;
+  document.getElementById('slsk-dot').className =
+    'dot' + (cls === 'ok' ? ' done' : cls === 'bad' ? ' error' : '');
+}
+
+function slskLog(lines, cls = '') {
+  const panel = document.getElementById('slsk-log');
+  panel.classList.add('open');
+  for (const line of [].concat(lines)) {
+    const div = document.createElement('div');
+    div.className = 'll ' + cls;
+    div.textContent = line;
+    panel.appendChild(div);
+  }
+}
+
+function applySlskStatus(s) {
+  if (!s.binary) {
+    setSlskState('unknown', 'sockseek not installed — pass unavailable');
+  } else if (s.configured) {
+    setSlskState('ok', `ready as ${s.username}` +
+      (s.source === 'environment' ? ' (from environment)' : ''));
+  } else {
+    setSlskState('unknown', 'no credentials — second pass will skip');
+  }
+}
+
+async function refreshSlskStatus() {
+  try {
+    applySlskStatus(await fetch('/soulseek/status').then(r => r.json()));
+  } catch {
+    setSlskState('unknown', 'status unavailable');
+  }
+}
+
+async function saveSlskCredentials() {
+  const btn  = document.getElementById('slsk-save');
+  const user = document.getElementById('slsk-user');
+  const pass = document.getElementById('slsk-pass');
+  if (!user.value.trim() || !pass.value) {
+    alert('Enter both a Soulseek username and password.');
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await fetch('/soulseek/credentials', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: user.value, password: pass.value }),
+    });
+    const data = await res.json();
+    if (!data.ok) { slskLog('Rejected: ' + data.error, 'err'); return; }
+    // Never keep the password in the DOM once it has been stored.
+    pass.value = '';
+    slskLog(`Saved. The next run will use Soulseek for tracks YouTube Music ` +
+            `cannot supply at 256 kbps.`, 'ok');
+    if (data.env_override) {
+      slskLog('Note: SPOTIMINE_SLSK_* environment variables are set and take ' +
+              'precedence over what you just saved.', 'err');
+    }
+    applySlskStatus(data);
+  } catch (err) {
+    slskLog('Save failed: ' + err, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function clearSlskCredentials() {
+  if (!confirm('Forget the stored Soulseek credentials? The second pass will stop running.')) return;
+  try {
+    const data = await fetch('/soulseek/credentials', { method: 'DELETE' })
+      .then(r => r.json());
+    slskLog(data.removed ? 'Credentials forgotten.' : 'Nothing was stored.', 'ok');
+    applySlskStatus(data);
+  } catch (err) {
+    slskLog('Could not clear: ' + err, 'err');
   }
 }
 

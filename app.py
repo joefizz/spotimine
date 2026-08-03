@@ -287,6 +287,40 @@ def check_cookies():
     return jsonify({"premium": ok, "log": lines})
 
 
+# ── soulseek credentials ──────────────────────────────────────────────────────
+# Same rules as the cookie endpoints: the password goes in, and nothing ever
+# comes back out. The username is returned so you can confirm which account is
+# configured, but there is no route that reads the password back.
+
+@app.route("/soulseek/status")
+def soulseek_status():
+    """What Soulseek configuration is in effect. Never returns the password."""
+    import soulseek
+    return jsonify(soulseek.credentials_status())
+
+
+@app.route("/soulseek/credentials", methods=["PUT"])
+def save_soulseek_credentials():
+    """Store Soulseek credentials for the second download pass."""
+    import soulseek
+    data = request.get_json(silent=True) or {}
+    try:
+        soulseek.save_credentials(data.get("username", ""), data.get("password", ""))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError as exc:
+        return jsonify({"ok": False, "error": f"Could not write config: {exc}"}), 500
+    return jsonify({"ok": True, **soulseek.credentials_status()})
+
+
+@app.route("/soulseek/credentials", methods=["DELETE"])
+def delete_soulseek_credentials():
+    """Forget the stored credentials, disabling the Soulseek pass."""
+    import soulseek
+    removed = soulseek.clear_credentials()
+    return jsonify({"ok": True, "removed": removed, **soulseek.credentials_status()})
+
+
 # ── tags ──────────────────────────────────────────────────────────────────────
 
 def _read_tags() -> dict:

@@ -79,28 +79,97 @@ def is_configured() -> tuple[bool, str]:
     return True, ""
 
 
-def _ensure_config() -> Path:
-    """Write the sockseek config from env vars if we have them.
-
-    Never logged and never returned by any endpoint; the file lives under the
-    already-gitignored data directory.
-    """
-    if not (USERNAME and PASSWORD):
-        return CONFIG_FILE
-
+def _write_config(username: str, password: str, origin: str) -> Path:
+    """Write the sockseek config file. Owner-only, atomic, never logged."""
     CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(
-        "# Written by spotimine from SPOTIMINE_SLSK_* environment variables.\n"
-        f"username = {USERNAME}\n"
-        f"password = {PASSWORD}\n"
+    tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
+    tmp.write_text(
+        f"# Written by spotimine from {origin}. Contains credentials.\n"
+        f"username = {username}\n"
+        f"password = {password}\n"
         f"listen-port = {LISTEN_PORT}\n",
         encoding="utf-8",
     )
     try:
-        os.chmod(CONFIG_FILE, 0o600)   # credentials
+        os.chmod(tmp, 0o600)   # credentials
     except OSError:
         pass
+    os.replace(tmp, CONFIG_FILE)
     return CONFIG_FILE
+
+
+def _ensure_config() -> Path:
+    """Refresh the config from environment variables if they are set.
+
+    The environment wins over anything saved through the web UI, so a deployment
+    that sets SPOTIMINE_SLSK_* stays authoritative.
+    """
+    if USERNAME and PASSWORD:
+        return _write_config(USERNAME, PASSWORD,
+                             "SPOTIMINE_SLSK_* environment variables")
+    return CONFIG_FILE
+
+
+def save_credentials(username: str, password: str) -> None:
+    """Validate and store Soulseek credentials.
+
+    Raises ValueError with a readable reason rather than writing something the
+    config parser would misread.
+    """
+    username = (username or "").strip()
+    password = password or ""
+
+    if not username:
+        raise ValueError("a Soulseek username is required")
+    if not password:
+        raise ValueError("a Soulseek password is required")
+    # The config is line-oriented "key = value", so a line break in either value
+    # would let the rest of the input inject arbitrary sockseek settings.
+    if any(c in username + password for c in "\r\n"):
+        raise ValueError("username and password cannot contain line breaks")
+
+    _write_config(username, password, "the web UI")
+
+
+def clear_credentials() -> bool:
+    """Delete the stored credentials. Returns whether there were any."""
+    if CONFIG_FILE.exists():
+        CONFIG_FILE.unlink()
+        return True
+    return False
+
+
+def _configured_username() -> str:
+    """The username currently in effect, or "" — never touches the password."""
+    if USERNAME:
+        return USERNAME
+    if CONFIG_FILE.exists():
+        for line in CONFIG_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "username":
+                return value.strip()
+    return ""
+
+
+def credentials_status() -> dict:
+    """Report what is configured. Deliberately never includes the password."""
+    ok, reason = is_configured()
+    has_binary = bool(shutil.which(BINARY)) or Path(BINARY).is_file()
+    if USERNAME and PASSWORD:
+        source = "environment"
+    elif CONFIG_FILE.exists():
+        source = "saved"
+    else:
+        source = None
+    return {
+        "binary": has_binary,
+        "configured": ok,
+        "reason": reason or None,
+        "username": _configured_username(),
+        "source": source,
+        # So the UI can explain that env vars override anything saved here.
+        "env_override": bool(USERNAME and PASSWORD),
+    }
 
 
 def write_track_list(songs: list[dict], path: Path) -> int:
