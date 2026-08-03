@@ -21,3 +21,5 @@ static/reports/
 # OS
 .DS_Store
 Thumbs.db
+
+.spotimine/

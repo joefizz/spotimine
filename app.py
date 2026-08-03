@@ -12,6 +12,8 @@ from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request, send_from_directory
 
+import quality
+
 SONGS_DIR   = Path("songs")
 REPORTS_DIR = Path("static") / "reports"
 AUDIO_EXTS  = {".mp3", ".m4a", ".opus", ".flac", ".wav"}
@@ -225,6 +227,64 @@ def purge_all():
 @app.route("/static/reports/<path:filename>")
 def serve_report(filename: str):
     return send_from_directory(REPORTS_DIR, filename)
+
+
+# ── youtube music session cookies ─────────────────────────────────────────────
+# These endpoints let cookies be pasted in from the browser, for hosts where
+# dropping a file next to the app isn't practical.  They deliberately never
+# return cookie contents — only whether what is stored works.
+
+def _reason(problem: str | None) -> str | None:
+    """Strip the machine-readable prefix off a quality.py problem string."""
+    return None if problem is None else problem.split(":", 1)[1].strip()
+
+
+@app.route("/cookies/status")
+def cookies_status():
+    """Report whether usable cookies are stored. Never returns their contents."""
+    problem = quality.check_cookie_file(quality.COOKIE_FILE)
+    return jsonify({
+        "present": quality.COOKIE_FILE.exists(),
+        "valid":   problem is None,
+        "reason":  _reason(problem),
+        "path":    str(quality.COOKIE_FILE),
+    })
+
+
+@app.route("/cookies", methods=["PUT"])
+def save_cookies():
+    """Accept pasted Netscape cookie text and store it.
+
+    Validation happens before the write, so a bad paste can't clobber cookies
+    that currently work.
+    """
+    data = request.get_json(silent=True) or {}
+    try:
+        quality.save_cookie_text(data.get("text", ""))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except OSError as exc:
+        return jsonify({"ok": False, "error": f"Could not write cookie file: {exc}"}), 500
+    return jsonify({"ok": True, "path": str(quality.COOKIE_FILE)})
+
+
+@app.route("/cookies/check", methods=["POST"])
+def check_cookies():
+    """Run the real itag 141 probe against the stored cookies.
+
+    Storing cookies proves nothing — an expired session or the wrong Google
+    account both look fine on disk — so this is what actually confirms Premium.
+    """
+    problem = quality.check_cookie_file(quality.COOKIE_FILE)
+    if problem:
+        return jsonify({"premium": False, "log": [_reason(problem)]})
+
+    lines: list[str] = []
+    try:
+        ok = quality.probe_premium(quality.COOKIE_FILE, lines.append)
+    except Exception as exc:
+        return jsonify({"premium": False, "log": lines + [str(exc)]}), 500
+    return jsonify({"premium": ok, "log": lines})
 
 
 # ── tags ──────────────────────────────────────────────────────────────────────

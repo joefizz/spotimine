@@ -114,34 +114,31 @@ def _iter_netscape_cookies(text: str):
         yield parts[0], parts[5], parts[6]
 
 
-def _check_cookie_file(path: Path) -> str | None:
-    """Validate the cookie file.
+def check_cookie_text(text: str, label: str = "the pasted cookies") -> str | None:
+    """Validate Netscape cookie text.
 
     Returns None if it looks usable, or a reason string describing what is
     wrong.  Reasons starting with "format:" are not recoverable automatically —
-    the user placed the wrong kind of file there and we must not overwrite it.
+    the content is the wrong kind of data entirely and must not overwrite a
+    working file.  "stale:" means it parsed but carries no signed-in session.
     """
-    if not path.exists():
-        return f"missing: no cookie file at {path}"
-    if path.stat().st_size == 0:
-        return f"missing: cookie file {path} is empty"
-
-    text = path.read_text(encoding="utf-8", errors="replace")
+    if not text.strip():
+        return f"format: {label} — empty"
 
     if text.lstrip().startswith(("{", "[")):
         return (
-            f"format: {path} is a JSON cookie export, not a Netscape cookie file.\n"
-            "Re-export your cookies in Netscape format (most browser cookie "
-            "extensions offer 'Netscape' or 'cookies.txt' as an export option) "
-            "and save them to that path."
+            f"format: {label} — this is a JSON cookie export, not a Netscape "
+            "cookie file. Re-export in Netscape format (most browser cookie "
+            "extensions offer 'Netscape' or 'cookies.txt' as an export option)."
         )
 
     cookies = list(_iter_netscape_cookies(text))
     if not cookies:
         return (
-            f"format: {path} is not in Netscape cookie format — no tab-separated "
-            "cookie lines found. Re-export your cookies in Netscape "
-            "(cookies.txt) format."
+            f"format: {label} — not in Netscape cookie format, no tab-separated "
+            "cookie lines found. Note that copying via a spreadsheet or a "
+            "rich-text editor turns the tabs into spaces; paste the raw "
+            "cookies.txt text."
         )
 
     for domain, name, _value in cookies:
@@ -149,14 +146,48 @@ def _check_cookie_file(path: Path) -> str | None:
             return None
 
     return (
-        f"stale: {path} has no {' or '.join(sorted(SESSION_COOKIE_NAMES))} cookie "
-        f"for a {YOUTUBE_DOMAIN} domain — the session is not signed in"
+        f"stale: {label} — no {' or '.join(sorted(SESSION_COOKIE_NAMES))} cookie "
+        f"for a {YOUTUBE_DOMAIN} domain, so the session is not signed in"
     )
+
+
+def check_cookie_file(path: Path) -> str | None:
+    """Validate the cookie file. See check_cookie_text for the return contract."""
+    if not path.exists():
+        return f"missing: no cookie file at {path}"
+    if path.stat().st_size == 0:
+        return f"missing: cookie file {path} is empty"
+    return check_cookie_text(
+        path.read_text(encoding="utf-8", errors="replace"), str(path)
+    )
+
+
+def save_cookie_text(text: str) -> None:
+    """Validate pasted cookie text and write it to COOKIE_FILE.
+
+    Raises ValueError with a readable reason if the text isn't a usable Netscape
+    cookie file, so a bad paste never clobbers working cookies.  The write is
+    atomic and the file is owner-only where the platform supports it.
+    """
+    normalised = text.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+
+    problem = check_cookie_text(normalised)
+    if problem:
+        raise ValueError(problem.split(":", 1)[1].strip())
+
+    COOKIE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = COOKIE_FILE.with_name(COOKIE_FILE.name + ".tmp")
+    tmp.write_text(normalised, encoding="utf-8")
+    try:
+        os.chmod(tmp, 0o600)   # these are credentials
+    except OSError:
+        pass
+    os.replace(tmp, COOKIE_FILE)
 
 
 # ── the probe that actually matters ───────────────────────────────────────────
 
-def _probe_premium(cookie_file: Path, log: LogFn) -> bool:
+def probe_premium(cookie_file: Path, log: LogFn) -> bool:
     """Return True if itag 141 (256 kbps AAC) is offered for the reference track.
 
     A cookie file existing proves nothing — expired sessions and the wrong
@@ -361,13 +392,13 @@ def ensure_premium_access(log: LogFn = print) -> None:
     """
     _require_binaries()
 
-    problem = _check_cookie_file(COOKIE_FILE)
+    problem = check_cookie_file(COOKIE_FILE)
     if problem and problem.startswith("format:"):
         # A wrong-format file was placed deliberately; refreshing would silently
         # overwrite it, so stop and say what to fix.
         raise QualityGateError(problem[len("format:"):].strip())
 
-    if problem is None and _probe_premium(COOKIE_FILE, log):
+    if problem is None and probe_premium(COOKIE_FILE, log):
         return
 
     if problem:
@@ -376,7 +407,7 @@ def ensure_premium_access(log: LogFn = print) -> None:
 
     # Tier 1 — automatic, no interaction.
     if _refresh_from_browser(COOKIE_FILE, log):
-        if _check_cookie_file(COOKIE_FILE) is None and _probe_premium(COOKIE_FILE, log):
+        if check_cookie_file(COOKIE_FILE) is None and probe_premium(COOKIE_FILE, log):
             log("Cookies refreshed from the browser profile; continuing.")
             return
         log("Refreshed cookies still do not grant Premium access.")
@@ -386,7 +417,7 @@ def ensure_premium_access(log: LogFn = print) -> None:
         raise _unattended_abort("Could not confirm YouTube Music Premium access.")
 
     if _interactive_login(COOKIE_FILE, log):
-        if _check_cookie_file(COOKIE_FILE) is None and _probe_premium(COOKIE_FILE, log):
+        if check_cookie_file(COOKIE_FILE) is None and probe_premium(COOKIE_FILE, log):
             log("Signed in interactively; continuing.")
             return
 

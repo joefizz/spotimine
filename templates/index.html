@@ -47,6 +47,23 @@
   button:hover { background:var(--accent2); }
   button:disabled { opacity:.35; cursor:default; }
 
+  /* ── youtube music session ── */
+  .cookie-head { display:flex; align-items:center; gap:.75rem; }
+  .cookie-head h2 { margin-bottom:0; }
+  .cookie-state { font-size:.8rem; font-weight:700; display:flex; align-items:center; gap:.4rem; }
+  .cookie-state.ok      { color:var(--teal); }
+  .cookie-state.bad     { color:var(--accent); }
+  .cookie-state.unknown { color:var(--muted); }
+  .cookie-head .btn-ghost { margin-left:auto; }
+  .cookie-body { display:none; margin-top:1.1rem; }
+  .cookie-body.open { display:block; }
+  .cookie-hint { font-size:.82rem; color:var(--muted); line-height:1.6; margin-bottom:.8rem; }
+  .cookie-hint code { background:var(--bg); border:1px solid var(--surf2); border-radius:4px; padding:.15rem .4rem; font-family:'Cascadia Code',Consolas,monospace; font-size:.78rem; color:var(--teal); display:inline-block; margin-top:.35rem; word-break:break-all; }
+  #cookie-text { width:100%; height:150px; resize:vertical; background:var(--bg); border:1px solid var(--surf2); border-radius:6px; padding:.7rem .9rem; color:var(--text); font-family:'Cascadia Code',Consolas,monospace; font-size:.78rem; outline:none; white-space:pre; overflow-wrap:normal; overflow-x:auto; }
+  #cookie-text:focus { border-color:var(--accent); }
+  #cookie-text::placeholder { color:#4a5a70; }
+  .cookie-actions { display:flex; gap:.7rem; margin-top:.8rem; }
+
   /* ── log ── */
   .log-panel { background:#0d0d1a; border:1px solid var(--surf2); border-radius:var(--r); padding:.9rem 1.1rem; margin-top:1rem; max-height:220px; overflow-y:auto; font-family:'Cascadia Code',Consolas,monospace; font-size:.8rem; line-height:1.65; display:none; }
   .log-panel.open { display:block; }
@@ -237,6 +254,33 @@
     <div class="log-panel" id="log-panel"></div>
   </div>
 
+  <!-- YouTube Music session -->
+  <div class="card-wrap">
+    <div class="cookie-head">
+      <h2>YouTube Music session</h2>
+      <span class="cookie-state unknown" id="cookie-state">
+        <span class="dot" id="cookie-dot"></span><span id="cookie-state-text">checking…</span>
+      </span>
+      <button class="btn-ghost" onclick="toggleCookiePanel()">Paste cookies</button>
+    </div>
+    <div class="cookie-body" id="cookie-body">
+      <p class="cookie-hint">
+        Downloads need a live Premium session. Sign in to YouTube Music in Firefox
+        on any machine, then generate the text with:
+        <code>yt-dlp --cookies-from-browser firefox --cookies cookies.txt --skip-download https://music.youtube.com/watch?v=dQw4w9WgXcQ</code>
+        and paste the whole contents of <code>cookies.txt</code> below.
+        Netscape format only — a JSON export is rejected. Tabs matter, so paste raw text.
+      </p>
+      <textarea id="cookie-text" spellcheck="false"
+                placeholder="# Netscape HTTP Cookie File&#10;.youtube.com&#9;TRUE&#9;/&#9;TRUE&#9;1800000000&#9;SAPISID&#9;…"></textarea>
+      <div class="cookie-actions">
+        <button id="cookie-save" onclick="saveCookies()">Save &amp; verify</button>
+        <button class="btn-ghost" id="cookie-check" onclick="checkPremium()">Re-check Premium</button>
+      </div>
+      <div class="log-panel" id="cookie-log"></div>
+    </div>
+  </div>
+
   <div class="main-content" id="main-content">
 
     <div class="main-left" id="main-left">
@@ -390,7 +434,7 @@ let sortState = { column: null, ascending: true };
 const audio   = document.getElementById('audio');
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-window.addEventListener('load', loadAll);
+window.addEventListener('load', () => { loadAll(); refreshCookieStatus(); });
 
 async function loadAll() {
   const [songs, charts, bounds] = await Promise.all([
@@ -721,6 +765,101 @@ function startAnalysis() {
     es.onerror = () => { setStatus('error', 'Connection lost'); btn.disabled = false; es.close(); };
   })
   .catch(err => { setStatus('error', String(err)); btn.disabled = false; });
+}
+
+// ── YouTube Music session cookies ─────────────────────────────────────────────
+
+function toggleCookiePanel() {
+  document.getElementById('cookie-body').classList.toggle('open');
+}
+
+function setCookieState(cls, text) {
+  const el = document.getElementById('cookie-state');
+  el.className = 'cookie-state ' + cls;
+  document.getElementById('cookie-state-text').textContent = text;
+  const dot = document.getElementById('cookie-dot');
+  dot.className = 'dot' + (cls === 'ok' ? ' done' : cls === 'bad' ? ' error' : '');
+}
+
+function cookieLog(lines, cls = '') {
+  const panel = document.getElementById('cookie-log');
+  panel.classList.add('open');
+  for (const line of [].concat(lines)) {
+    const div = document.createElement('div');
+    div.className = 'll ' + cls;
+    div.textContent = line;
+    panel.appendChild(div);
+  }
+  panel.scrollTop = panel.scrollHeight;
+}
+
+function clearCookieLog() {
+  const panel = document.getElementById('cookie-log');
+  panel.innerHTML = '';
+  panel.classList.remove('open');
+}
+
+// Stored cookies working is not the same as Premium being live, so this only
+// reports what is on disk. The probe is a separate, explicit action.
+async function refreshCookieStatus() {
+  try {
+    const s = await fetch('/cookies/status').then(r => r.json());
+    if (s.valid)        setCookieState('unknown', 'cookies stored — Premium unverified');
+    else if (s.present) setCookieState('bad', s.reason || 'stored cookies unusable');
+    else                setCookieState('bad', 'no cookies — downloads will fail');
+  } catch {
+    setCookieState('unknown', 'status unavailable');
+  }
+}
+
+async function saveCookies() {
+  const btn  = document.getElementById('cookie-save');
+  const text = document.getElementById('cookie-text').value;
+  if (!text.trim()) { alert('Paste your cookies.txt contents first.'); return; }
+
+  clearCookieLog();
+  btn.disabled = true;
+  try {
+    const res = await fetch('/cookies', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      cookieLog('Rejected: ' + data.error, 'err');
+      setCookieState('bad', 'paste rejected');
+      return;
+    }
+    cookieLog('Saved to ' + data.path, 'ok');
+    document.getElementById('cookie-text').value = '';
+    await checkPremium();
+  } catch (err) {
+    cookieLog('Save failed: ' + err, 'err');
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function checkPremium() {
+  const btn = document.getElementById('cookie-check');
+  btn.disabled = true;
+  setCookieState('unknown', 'probing YouTube Music…');
+  try {
+    const data = await fetch('/cookies/check', { method: 'POST' }).then(r => r.json());
+    cookieLog(data.log || [], data.premium ? 'ok' : 'err');
+    if (data.premium) {
+      setCookieState('ok', 'Premium confirmed — 256 kbps available');
+    } else {
+      setCookieState('bad', 'Premium NOT confirmed — downloads will abort');
+      cookieLog('Check you signed in with the Google account that holds Premium.', 'err');
+    }
+  } catch (err) {
+    cookieLog('Probe failed: ' + err, 'err');
+    setCookieState('bad', 'probe failed');
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function setStatus(state, text) {
