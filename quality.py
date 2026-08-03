@@ -88,6 +88,45 @@ class QualityGateError(RuntimeError):
 
 # ── binaries ──────────────────────────────────────────────────────────────────
 
+# yt-dlp needs a JavaScript runtime to solve YouTube's signature challenge.
+# Without one it returns an empty format list, which is indistinguishable from
+# "this account has no Premium" unless you look for it specifically.
+# In yt-dlp's own order of preference; only deno is enabled by default.
+JS_RUNTIMES = ("deno", "node")
+
+
+def _find_js_runtime() -> tuple[str, str] | None:
+    """Locate a JavaScript runtime for yt-dlp. Returns (name, path) or None."""
+    for name in JS_RUNTIMES:
+        found = shutil.which(name)
+        if found:
+            return name, found
+
+    # spotdl downloads its own Deno for exactly this purpose and wires it into
+    # its internal yt-dlp calls, but it never lands on PATH — so reuse it here
+    # rather than making the user install a second copy.
+    try:
+        from spotdl.utils.deno import get_local_deno
+
+        local = get_local_deno()
+        if local and os.access(local, os.X_OK):
+            return "deno", str(local)
+    except Exception:
+        pass
+
+    return None
+
+
+def _ytdlp_cmd() -> list[str]:
+    """Base yt-dlp argv, with a JavaScript runtime wired in when one was found."""
+    cmd = ["yt-dlp"]
+    runtime = _find_js_runtime()
+    if runtime:
+        name, path = runtime
+        cmd += ["--js-runtimes", f"{name}:{path}"]
+    return cmd
+
+
 def _require_binaries():
     missing = [b for b in ("yt-dlp", "ffmpeg", "ffprobe") if not shutil.which(b)]
     if missing:
@@ -97,6 +136,18 @@ def _require_binaries():
             "~/.spotdl/, and no ffprobe — that is not enough. Install a full "
             "ffmpeg build (which includes ffprobe) and put it on PATH; yt-dlp "
             "comes with spotdl but must also be reachable as `yt-dlp`."
+        )
+
+    if _find_js_runtime() is None:
+        raise QualityGateError(
+            "No JavaScript runtime found (looked for "
+            f"{' or '.join(JS_RUNTIMES)} on PATH, and spotdl's bundled Deno).\n"
+            "yt-dlp needs one to solve YouTube's signature challenge; without it "
+            "it returns an empty format list and Premium can never be "
+            "confirmed.\n"
+            "Fix with either:\n"
+            "  spotdl --download-deno      (reuses spotdl's own copy)\n"
+            "  apt-get install -y nodejs   (or install Deno system-wide)"
         )
 
 
@@ -195,7 +246,7 @@ def probe_premium(cookie_file: Path, log: LogFn) -> bool:
     """
     log(f"Probing YouTube Music for itag {PREMIUM_ITAG} (256 kbps AAC) ...")
     proc = subprocess.run(
-        ["yt-dlp", "--cookies", str(cookie_file), "-F", REFERENCE_YTM_TRACK_URL],
+        [*_ytdlp_cmd(), "--cookies", str(cookie_file), "-F", REFERENCE_YTM_TRACK_URL],
         capture_output=True,
         text=True,
     )
@@ -207,15 +258,38 @@ def probe_premium(cookie_file: Path, log: LogFn) -> bool:
             log(f"    {line}")
         return False
 
+    audio_formats = 0
     for line in proc.stdout.splitlines():
-        token = line.strip().split(maxsplit=1)[0] if line.strip() else ""
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if "audio only" in stripped:
+            audio_formats += 1
+        token = stripped.split(maxsplit=1)[0]
         # "141" and DRC variants such as "141-drc" both indicate the Premium
         # stream is available.
         if token.split("-", 1)[0] == PREMIUM_ITAG:
             log(f"  itag {PREMIUM_ITAG} present — Premium session confirmed.")
             return True
 
-    log(f"  itag {PREMIUM_ITAG} absent from the format list.")
+    # No audio formats at all is an extraction failure, not a verdict on the
+    # account. Saying "check your Google account" here sends people hunting for
+    # a problem that isn't theirs.
+    if audio_formats == 0:
+        log("  yt-dlp returned NO audio formats at all, so this is an "
+            "extraction failure rather than a Premium verdict.")
+        if "Only images are available" in output or "challenge" in output.lower():
+            log("  It could not solve YouTube's signature challenge — its "
+                "JavaScript runtime is missing or not working.")
+        if "older than" in output:
+            log("  yt-dlp also reports it is out of date; update it "
+                "(pip install -U yt-dlp).")
+        for line in (proc.stderr or "").strip().splitlines()[:4]:
+            log(f"    {line}")
+        return False
+
+    log(f"  itag {PREMIUM_ITAG} absent from a list of {audio_formats} audio "
+        "format(s) — the session works but is not Premium.")
     if "Sign in" in output or "not a bot" in output:
         log("  yt-dlp reports the request was not authenticated.")
     return False
@@ -238,7 +312,7 @@ def _refresh_from_browser(cookie_file: Path, log: LogFn) -> bool:
         log(f"Refreshing cookies from browser profile ({target}) ...")
         proc = subprocess.run(
             [
-                "yt-dlp",
+                *_ytdlp_cmd(),
                 "--cookies-from-browser", target,
                 "--cookies", str(cookie_file),
                 "--skip-download",

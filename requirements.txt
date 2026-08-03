@@ -5,6 +5,9 @@ librosa
 matplotlib
 numpy
 soundfile
-# Tier 2 cookie recovery only (visible browser login). Needs a one-time
-# `playwright install firefox`; the premium gate skips tier 2 when unattended.
-playwright
+# Tier 2 cookie recovery (visible browser login) additionally needs:
+#     pip install playwright && playwright install firefox
+# Deliberately not listed as a dependency: it is a 46 MB wheel that unattended
+# hosts can never use, because the premium gate skips tier 2 when there is no
+# display or TTY. Install it only on a desktop machine where you want the
+# interactive login; quality.py degrades with a clear message without it.
