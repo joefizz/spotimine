@@ -73,6 +73,36 @@ VALID_SAMPLE_RATES   = {44100, 48000}
 MIN_FILE_BYTES       = 1024 * 1024
 DURATION_TOLERANCE_S = 4.0
 
+# Codecs that carry no lossy generation loss, so the bitrate floor does not apply
+# to them — a FLAC at 900 kbps and one at 1400 kbps are both bit-exact.
+LOSSLESS_CODECS = {"flac", "alac", "pcm_s16le", "pcm_s24le", "pcm_s32le"}
+
+# Per-source verification profiles.  A profile only ever *describes* what an
+# acceptable file looks like from that source; the checks themselves are shared.
+#
+# "ytmusic" is the original rule set, unchanged, and is the default so that every
+# existing caller keeps its exact behaviour.  "soulseek" exists because files come
+# from strangers in whatever container they happen to own: rejecting FLAC as
+# WRONG_CODEC would throw away audio that is *better* than the 256 kbps AAC the
+# YouTube Music path targets.
+PROFILES = {
+    "ytmusic": {
+        "codecs":       {"aac"},
+        "min_bitrate":  MIN_BITRATE,
+        "sample_rates": VALID_SAMPLE_RATES,
+        "spectral":     False,
+    },
+    "soulseek": {
+        "codecs":       {"flac", "alac", "wav", "pcm_s16le", "pcm_s24le", "mp3", "aac"},
+        # Lossy from a peer must clear 256k, not the 200k itag-141 allowance:
+        # there is no "not strictly CBR" excuse for a file someone else encoded.
+        "min_bitrate":  256_000,
+        "sample_rates": {44100, 48000, 88200, 96000, 176400, 192000},
+        "spectral":     True,
+    },
+}
+DEFAULT_PROFILE = "ytmusic"
+
 FFPROBE_ARGS = [
     "-v", "error",
     "-select_streams", "a:0",
@@ -531,13 +561,250 @@ def probe_audio(path: Path) -> dict:
         raise RuntimeError(f"unparseable ffprobe output: {exc}") from exc
 
 
-def verify_download(path: Path, expected_duration_s: float | None) -> tuple[str | None, dict]:
+# ── transcode detection ───────────────────────────────────────────────────────
+# A 128 kbps MP3 re-encoded to FLAC or to 320 kbps passes every metadata check
+# above: right codec, high nominal bitrate, stereo, 44.1 kHz, right duration. It
+# still sounds like 128 kbps. Lossy encoders impose a lowpass ceiling, and once
+# the energy above it has been discarded it is gone — FLAC then preserves the hole
+# faithfully, and a higher-bitrate re-encode has nothing to put back. The lowest
+# ceiling in the chain wins permanently, and ffprobe only describes the final
+# container, which is why it cannot see any of this.
+#
+# Honest about the limits: at a threshold conservative enough never to reject a
+# genuine 1960s master or vinyl rip, this catches <=192 kbps ancestry reliably and
+# does NOT catch 256 kbps AAC or 320 kbps Vorbis ancestry (AAC has no consistent
+# brickwall, and HE-AAC synthesises highs so the file looks full-band). This is a
+# filter for egregious fraud, not a proof of losslessness.
+
+SPECTRAL_N_FFT      = 8192
+SPECTRAL_LOUD_FRAC  = 0.30    # analyse only the loudest frames
+SPECTRAL_FLOOR_DB   = 60.0    # below the 500 Hz–5 kHz reference level
+SPECTRAL_SEGMENTS   = 8
+SPECTRAL_MIN_SECONDS = 20     # below this there is not enough to judge on
+
+# Decision thresholds, all expressed against Nyquist or the programme level so
+# they hold regardless of sample rate or how loud the master is.
+SPECTRAL_FULLBAND_RATIO  = 0.90   # >= this fraction of Nyquist: simply fine
+SPECTRAL_AMBIGUOUS_RATIO = 0.84   # between: could be legitimate mastering
+SPECTRAL_MIN_CLIFF_DB    = 25.0   # an encoder wall; acoustic rolloff is gentler
+SPECTRAL_NOISY_TAIL_DB   = -60.0  # noise above the ceiling => real band-limited source
+
+# Lowpass frequencies real encoders use. A measured cutoff that matches none of
+# these is a band-limited *source* (old master, vinyl, spoken word), not a
+# transcode — cheap and high-value discrimination.
+CANONICAL_CUTOFFS_HZ = (16000, 17000, 17500, 18500, 18600, 19000,
+                        19400, 19500, 19700, 20000, 20500)
+CANONICAL_TOLERANCE_HZ = 300
+
+# Enforcement is opt-in. Ship in log-only mode, review what it *would* have
+# rejected on a real corpus, then turn it on.
+SPECTRAL_ENFORCE = os.environ.get("SPOTIMINE_SPECTRAL_ENFORCE", "").strip() not in ("", "0")
+
+
+def _matches_canonical_cutoff(cutoff_hz: float) -> bool:
+    return any(abs(cutoff_hz - c) <= CANONICAL_TOLERANCE_HZ for c in CANONICAL_CUTOFFS_HZ)
+
+
+def _spectral_metrics(samples, sr: int) -> dict | None:
+    """Cutoff, cliff steepness and tail level for one channel of audio."""
+    import numpy as np
+    import librosa
+
+    spec = np.abs(
+        librosa.stft(samples, n_fft=SPECTRAL_N_FFT, hop_length=SPECTRAL_N_FFT // 2,
+                     window="blackmanharris", center=False)
+    ) ** 2
+    if spec.shape[1] < 4:
+        return None
+
+    # Loud frames only: silent intros, fades and quiet passages have no high
+    # frequencies to measure and would otherwise look exactly like a transcode.
+    energy = spec.sum(axis=0)
+    spec = spec[:, energy >= np.quantile(energy, 1.0 - SPECTRAL_LOUD_FRAC)]
+
+    psd = np.median(spec, axis=1)          # median: robust to broadband transients
+    db = 10 * np.log10(psd + 1e-30)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=SPECTRAL_N_FFT)
+    bin_hz = sr / SPECTRAL_N_FFT
+
+    # Edge-normalised moving average. A plain mode="same" convolution zero-pads,
+    # and because these are negative dB values that drags the top bins *up*
+    # toward 0 dB — fabricating energy at Nyquist and hiding every real cliff.
+    # Dividing by the number of contributing samples fixes the edges exactly.
+    smooth = max(1, int(round(400 / bin_hz)))
+    kernel = np.ones(smooth)
+    db = (np.convolve(db, kernel, mode="same")
+          / np.convolve(np.ones_like(db), kernel, mode="same"))
+
+    # Reference from the midrange, not the peak: the peak is a bass bin and
+    # genuine 20 kHz content sits 60–85 dB below it.
+    band = (freqs >= 500) & (freqs <= 5000)
+    if not band.any():
+        return None
+    reference = float(np.percentile(db[band], 95))
+    threshold = reference - SPECTRAL_FLOOR_DB
+
+    above = np.nonzero(db > threshold)[0]
+    cut_i = int(above[-1]) if above.size else 0
+    cutoff = float(freqs[cut_i])
+
+    delta = int(round(1000 / bin_hz))
+    lo = max(0, cut_i - delta)
+    hi = min(len(db) - 1, cut_i + delta)
+    cliff_db = float(db[lo] - db[hi])
+
+    # How much is left above the ceiling, measured *relative to the programme
+    # level*. Absolute dBFS does not transfer between quiet and loud masters, so a
+    # relative figure is what generalises: vinyl surface noise and 16-bit dither
+    # sit maybe 60-90 dB below programme and continue to Nyquist, whereas above a
+    # lossy encoder's wall there is only filterbank leakage, far further down.
+    tail = freqs >= cutoff + 500
+    tail_db = float(np.median(db[tail])) if tail.any() else float("-inf")
+    tail_rel_db = tail_db - reference
+
+    nyquist = sr / 2
+    return {
+        "cutoff_hz": cutoff,
+        "cutoff_ratio": cutoff / nyquist,
+        "cliff_db": cliff_db,
+        "tail_rel_db": tail_rel_db,
+        "reference_db": reference,
+        "nyquist_hz": nyquist,
+    }
+
+
+def analyse_spectrum(path: Path) -> dict:
+    """Measure the spectral ceiling of a file and judge whether it is a transcode.
+
+    Returns a dict with the metrics plus "verdict" (one of "pass",
+    "band_limited_source", "suspect") and "detail".  Never raises: an analysis
+    failure yields a pass, because refusing to guess is the point.
+    """
+    try:
+        import numpy as np
+        import librosa
+
+        # sr=None is essential: resampling would install its own lowpass and
+        # fabricate exactly the cliff we are looking for.
+        audio, sr = librosa.load(str(path), sr=None, mono=False)
+    except Exception as exc:
+        return {"verdict": "pass", "detail": f"not analysed: {exc}"}
+
+    channels = audio if getattr(audio, "ndim", 1) > 1 else [audio]
+
+    # Too short to judge: a few seconds gives too few loud frames to distinguish a
+    # transcode from a quiet passage. Refusing to guess is the whole point.
+    if len(channels[0]) < SPECTRAL_MIN_SECONDS * sr:
+        return {
+            "verdict": "pass",
+            "detail": f"only {len(channels[0]) / sr:.1f}s of audio — too short to judge",
+        }
+
+    per_channel = []
+    for ch in channels:
+        try:
+            m = _spectral_metrics(ch, sr)
+        except Exception as exc:
+            return {"verdict": "pass", "detail": f"not analysed: {exc}"}
+        if m:
+            per_channel.append(m)
+
+    if not per_channel:
+        return {"verdict": "pass", "detail": "too short to analyse"}
+
+    # Most generous channel: joint-stereo can strip highs asymmetrically.
+    best = max(per_channel, key=lambda m: m["cutoff_ratio"])
+
+    # Segment agreement, so one odd passage cannot condemn a whole file.
+    agree = 1.0
+    try:
+        import numpy as np
+
+        mono = channels[0]
+        seg_len = len(mono) // SPECTRAL_SEGMENTS
+        if seg_len > sr:  # only meaningful for segments over a second
+            ratios = []
+            for i in range(SPECTRAL_SEGMENTS):
+                m = _spectral_metrics(mono[i * seg_len:(i + 1) * seg_len], sr)
+                if m:
+                    ratios.append(m["cutoff_ratio"])
+            if len(ratios) >= 3:
+                near = [r for r in ratios if abs(r - best["cutoff_ratio"]) <= 0.05]
+                agree = len(near) / len(ratios)
+            else:
+                # Fewer than three usable segments is insufficient evidence.
+                best["verdict"] = "pass"
+                best["detail"] = "too few usable segments to judge"
+                best["segment_agreement"] = None
+                return best
+    except Exception:
+        agree = 1.0
+
+    ratio     = best["cutoff_ratio"]
+    cliff     = best["cliff_db"]
+    tail      = best["tail_rel_db"]
+    canonical = _matches_canonical_cutoff(best["cutoff_hz"])
+    best["segment_agreement"] = agree
+    best["canonical_cutoff"]  = canonical
+
+    # Content all the way up is simply fine — check this before anything else, so
+    # a full-band file is never mislabelled as band-limited.
+    if ratio >= SPECTRAL_FULLBAND_RATIO:
+        best["verdict"] = "pass"
+        best["detail"] = f"full-band to {best['cutoff_hz']:.0f} Hz"
+        return best
+
+    # A gradual rolloff, or noise that carries on past the ceiling, means a
+    # band-limited *source*: vinyl surface noise, tape hiss and 16-bit dither all
+    # continue to Nyquist. Above a lossy encoder's wall, nothing does.
+    if cliff < SPECTRAL_MIN_CLIFF_DB or tail > SPECTRAL_NOISY_TAIL_DB:
+        best["verdict"] = "band_limited_source"
+        best["detail"] = (
+            f"ceiling {best['cutoff_hz']:.0f} Hz but the rolloff is gradual "
+            f"({cliff:.1f} dB) or noise continues above it ({tail:.1f} dB "
+            "relative) — consistent with an analogue or deliberately "
+            "band-limited source"
+        )
+        return best
+
+    if ratio >= SPECTRAL_AMBIGUOUS_RATIO:
+        # V0 / 192k CBR / Opus / AAC-256 territory, and equally the territory of
+        # perfectly legitimate mastering. Not actionable either way.
+        best["verdict"] = "pass"
+        best["detail"] = (
+            f"ceiling {best['cutoff_hz']:.0f} Hz ({ratio:.0%} of Nyquist) — could be "
+            "a high-bitrate lossy ancestor or a deliberate master; not actionable"
+        )
+        return best
+
+    # Below the ambiguous band and with a brick wall: require every corroborating
+    # signal to agree before calling it fraud.
+    strong = cliff >= SPECTRAL_MIN_CLIFF_DB and canonical and agree >= 0.70
+    best["verdict"] = "suspect" if strong else "pass"
+    best["detail"] = (
+        f"ceiling {best['cutoff_hz']:.0f} Hz ({ratio:.0%} of Nyquist), cliff "
+        f"{cliff:.1f} dB, tail {tail:.1f} dB relative, agreement {agree:.0%}"
+        + ("" if canonical else " — matches no known encoder cutoff, so more "
+                               "likely a band-limited master than a transcode")
+    )
+    return best
+
+
+def verify_download(
+    path: Path,
+    expected_duration_s: float | None,
+    profile: str = DEFAULT_PROFILE,
+) -> tuple[str | None, dict]:
     """Check a downloaded file. Returns (failure_reason, probe_output).
 
     ``failure_reason`` is None when the file passes.  Anything ambiguous — an
     ffprobe error, a missing field, an unparseable value — counts as a failure;
     nothing ambiguous is ever treated as a pass.
+
+    ``profile`` selects the per-source rules in PROFILES and defaults to the
+    original YouTube Music rule set, so existing callers are unaffected.
     """
+    rules = PROFILES.get(profile) or PROFILES[DEFAULT_PROFILE]
     # Size first, so a half-written file reports TRUNCATED rather than the
     # ffprobe error that truncation causes.
     size = path.stat().st_size if path.exists() else 0
@@ -551,27 +818,38 @@ def verify_download(path: Path, expected_duration_s: float | None) -> tuple[str 
 
     # Recorded up front so a sidecar quarantined by an earlier check still shows
     # what duration was expected, rather than a bare null that reads as "unknown".
-    probe = {**probe, "file_size": size, "expected_duration": expected_duration_s}
+    probe = {
+        **probe,
+        "file_size": size,
+        "expected_duration": expected_duration_s,
+        "profile": profile,
+    }
     streams = probe.get("streams") or []
     if not streams:
         return "PROBE_FAILED", {**probe, "error": "no audio stream reported"}
     stream = streams[0]
 
-    if stream.get("codec_name") != "aac":
+    codec = stream.get("codec_name")
+    if codec not in rules["codecs"]:
         return "WRONG_CODEC", probe
 
-    try:
-        bit_rate = int(stream["bit_rate"])
-    except (KeyError, TypeError, ValueError):
-        return "PROBE_FAILED", {**probe, "error": "stream bit_rate missing or unparseable"}
-    if bit_rate < MIN_BITRATE:
-        return "LOW_BITRATE", probe
+    # Lossless carries no generation loss, so a bitrate floor is meaningless for
+    # it — and ffprobe often reports no stream bit_rate for FLAC at all.
+    if codec in LOSSLESS_CODECS:
+        probe["lossless"] = True
+    else:
+        try:
+            bit_rate = int(stream["bit_rate"])
+        except (KeyError, TypeError, ValueError):
+            return "PROBE_FAILED", {**probe, "error": "stream bit_rate missing or unparseable"}
+        if bit_rate < rules["min_bitrate"]:
+            return "LOW_BITRATE", probe
 
     try:
         sample_rate = int(stream["sample_rate"])
     except (KeyError, TypeError, ValueError):
         return "PROBE_FAILED", {**probe, "error": "stream sample_rate missing or unparseable"}
-    if sample_rate not in VALID_SAMPLE_RATES:
+    if sample_rate not in rules["sample_rates"]:
         return "BAD_SAMPLE_RATE", probe
 
     try:
@@ -596,6 +874,18 @@ def verify_download(path: Path, expected_duration_s: float | None) -> tuple[str 
 
     if abs(actual - expected_duration_s) > DURATION_TOLERANCE_S:
         return "DURATION_MISMATCH", probe
+
+    # Last, because it is the only expensive check — decode plus STFT.
+    if rules.get("spectral"):
+        spectrum = analyse_spectrum(path)
+        probe["spectral"] = spectrum
+        if spectrum.get("verdict") == "suspect":
+            if SPECTRAL_ENFORCE:
+                return "TRANSCODE_SUSPECTED", probe
+            probe["spectral"]["enforcement"] = (
+                "log-only: would have been rejected as TRANSCODE_SUSPECTED. Set "
+                "SPOTIMINE_SPECTRAL_ENFORCE=1 to enforce."
+            )
 
     return None, probe
 
