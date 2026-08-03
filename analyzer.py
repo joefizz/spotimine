@@ -490,16 +490,26 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     ]
     from_soulseek = len(verifier.promoted) - from_ytmusic
 
+    # A quarantined track is also an unavailable one, so listing both in full
+    # reads as double-counting. Lead with an accounting that reconciles against
+    # the playlist, then break the shortfall down with each name appearing once.
+    quarantined_names = {name for name, _ in verifier.quarantined}
+    never_found = [n for n in still_missing if n not in quarantined_names]
+
     log("\n── Download summary ─────────────────────────────")
-    log(f"  Verified from YouTube Music: {from_ytmusic}")
+    log(f"  {len(songs)} track(s): {len(verifier.promoted)} in library, "
+        f"{len(still_missing)} unavailable")
+    log(f"    from YouTube Music:    {from_ytmusic}")
     if from_soulseek:
-        log(f"  Verified from Soulseek:      {from_soulseek}")
-    log(f"  Quarantined:                 {len(verifier.quarantined)}")
-    for name, reason in verifier.quarantined:
-        log(f"    • {name}  [{reason}]")
-    log(f"  Still unavailable:           {len(still_missing)}")
-    for name in still_missing:
-        log(f"    • {name}")
+        log(f"    from Soulseek:         {from_soulseek}")
+    if verifier.quarantined:
+        log(f"  Rejected after download: {len(verifier.quarantined)}")
+        for name, reason in verifier.quarantined:
+            log(f"    • {name}  [{reason}]")
+    if never_found:
+        log(f"  Never found: {len(never_found)}")
+        for name in never_found:
+            log(f"    • {name}")
 
     if verifier.stopped_early:
         remaining = len(_audio_files(staging_dir))
