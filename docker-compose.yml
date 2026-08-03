@@ -9,6 +9,12 @@ services:
       - ./static/reports:/app/static/reports
       # YouTube Music cookies — the premium gate reads .spotimine/cookies.txt
       - ./.spotimine:/app/.spotimine
+      # Source mounted for development: a code change is a `docker compose
+      # restart`, not a rebuild. Remove these for an immutable deployment.
+      - ./analyzer.py:/app/analyzer.py
+      - ./quality.py:/app/quality.py
+      - ./app.py:/app/app.py
+      - ./templates:/app/templates
     environment:
       # No display in a container, so the interactive login tier is skipped
       # rather than attempted; refresh cookies on the host instead.

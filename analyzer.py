@@ -45,9 +45,24 @@ LogFn = Callable[[str], None]
 # ── download staging ──────────────────────────────────────────────────────────
 # spotdl writes into STAGING_DIRNAME; files only reach the library after passing
 # quality.verify_download.  Failures land in QUARANTINE_DIRNAME.
-STAGING_DIRNAME    = ".staging"
+#
+# None of these may start with a dot.  spotdl runs every --output template through
+# create_path_object(), which strips leading dots from *every* path component
+# (".staging" silently becomes "staging"), so a hidden staging directory means
+# spotdl writes somewhere we never look and every download is discarded.
+STAGING_DIRNAME    = "staging"
 QUARANTINE_DIRNAME = "quarantine"
-ARCHIVE_FILENAME   = ".spotdl-archive"
+ARCHIVE_FILENAME   = "spotdl-archive"
+
+# Filename templates.  Staged files carry the Spotify track id so two tracks with
+# the same artist and title cannot collide; the library name drops it.
+STAGING_TEMPLATE = "{artists} - {title} [{track-id}].{output-ext}"
+LIBRARY_TEMPLATE = "{artists} - {title}.{output-ext}"
+
+# Pinned so our path resolution cannot disagree with spotdl whatever the user's
+# ~/.spotdl/config.json says.  Behaviourally identical to the unset default, but
+# "strict" would rewrite "A - B [id]" to "A-B_id_" and destroy the track id.
+RESTRICT_MODE = "none"
 
 # Three low-bitrate results in a row means the session lost Premium partway
 # through, not three unlucky tracks — stop rather than quarantining the rest of
@@ -59,7 +74,13 @@ AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".wav"}
 # Staged filenames carry the Spotify track id so each file can be tied back to
 # its metadata; the suffix is stripped when the file is promoted.
 _TRACK_ID_RE  = re.compile(r"^(?P<name>.+) \[(?P<track_id>[A-Za-z0-9]{16,})\]$")
-_DOWNLOADED_RE = re.compile(r'Downloaded "(?P<name>.+)": (?P<url>\S+)')
+
+# spotdl logs `Downloaded "<artist> - <title>": <url>`, but its console wraps long
+# lines and puts the URL on the next one — so the URL has to be matched both
+# inline and as a continuation, or every long track name loses its source URL.
+_DOWNLOADED_RE      = re.compile(r'Downloaded "(?P<name>.+)": (?P<url>\S+)')
+_DOWNLOADED_WRAP_RE = re.compile(r'Downloaded "(?P<name>.+)":\s*$')
+_URL_ONLY_RE        = re.compile(r"^(?P<url>https?://\S+)$")
 
 
 def _audio_files(directory: Path) -> list[Path]:
@@ -67,6 +88,22 @@ def _audio_files(directory: Path) -> list[Path]:
         return []
     return sorted(p for p in directory.iterdir()
                   if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
+
+
+def _find_staged(expected: Path) -> Path | None:
+    """Locate a staged file, tolerating a container other than the one requested.
+
+    We ask spotdl for the .m4a path, but if it ever produces a different
+    container we still want to find, verify and quarantine that file rather than
+    report the track as never downloaded.
+    """
+    if expected.exists():
+        return expected
+    for ext in AUDIO_EXTS:
+        alt = expected.with_suffix(ext)
+        if alt.exists():
+            return alt
+    return None
 
 
 def _ensure_ffmpeg(log: LogFn):
@@ -108,12 +145,13 @@ def _mark_analyzed(reports_dir: Path, filename: str, metadata: dict):
     _write_analyzed_tracks(reports_dir, analyzed)
 
 
-def _fetch_track_metadata(url: str, staging_dir: Path) -> dict[str, dict]:
+def _fetch_track_metadata(url: str, staging_dir: Path) -> list[dict]:
     """Ask spotdl for the playlist's Spotify metadata before downloading anything.
 
-    Returns {spotify_track_id: {"duration": seconds, "name": str, "url": str}}.
-    spotdl's Song.duration is Spotify's duration_ms floored to whole seconds,
-    which is comfortably inside the ±4 s tolerance used when verifying.
+    Returns the raw song dicts, which carry everything needed later: the duration
+    (Spotify's duration_ms floored to whole seconds, comfortably inside the ±4 s
+    verification tolerance) and enough fields to rebuild a spotdl Song and ask it
+    where each download will land.
     """
     save_file = staging_dir / "playlist.spotdl"
     proc = subprocess.run(
@@ -131,20 +169,36 @@ def _fetch_track_metadata(url: str, staging_dir: Path) -> dict[str, dict]:
 
     raw = json.loads(save_file.read_text(encoding="utf-8"))
     songs = raw.get("songs", []) if isinstance(raw, dict) else raw
+    return [s for s in songs if s.get("song_id") and s.get("duration")]
 
-    meta: dict[str, dict] = {}
-    for song in songs:
-        track_id = song.get("song_id")
-        duration = song.get("duration")
-        if not track_id or not duration:
-            continue
-        artist = song.get("artist") or (song.get("artists") or [""])[0]
-        meta[track_id] = {
-            "duration": float(duration),
-            "name": f"{artist} - {song.get('name', '')}".strip(" -"),
-            "url": song.get("url", ""),
-        }
-    return meta
+
+def _display_name(song: dict) -> str:
+    artist = song.get("artist") or (song.get("artists") or [""])[0]
+    return f"{artist} - {song.get('name', '')}".strip(" -")
+
+
+def _resolve_paths(song: dict, staging_dir: Path, library_dir: Path) -> tuple[Path, Path] | None:
+    """Ask spotdl where it will write this song, and where it belongs once verified.
+
+    Returns (staging_path, library_path), or None if spotdl's own resolver could
+    not be used.  Going through create_file_name rather than assembling strings is
+    what keeps us honest about spotdl's filename sanitisation — including the
+    long-name fallback that drops the directory prefix entirely.
+    """
+    try:
+        from spotdl.types.song import Song
+        from spotdl.utils.formatter import create_file_name
+
+        obj = Song.from_dict(song)
+        staged = create_file_name(
+            obj, str(staging_dir / STAGING_TEMPLATE), "m4a", restrict=RESTRICT_MODE
+        )
+        final = create_file_name(
+            obj, str(library_dir / LIBRARY_TEMPLATE), "m4a", restrict=RESTRICT_MODE
+        )
+        return staged, final
+    except Exception:
+        return None
 
 
 def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[Path]:
@@ -161,8 +215,8 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     log("Reading Spotify track metadata ...")
-    track_meta = _fetch_track_metadata(url, staging_dir)
-    log(f"Got Spotify durations for {len(track_meta)} track(s).")
+    songs = _fetch_track_metadata(url, staging_dir)
+    log(f"Got Spotify durations for {len(songs)} track(s).")
 
     # The archive holds the Spotify URLs of tracks already verified and in the
     # library, so they aren't re-downloaded.  Quarantined tracks stay out of it
@@ -180,66 +234,82 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     process = subprocess.Popen(
         [
             "spotdl", url,
-            # All four of these are required together for 256 kbps AAC.
-            # Dropping any one of them silently yields 128 kbps.
+            # These three together are what produce 256 kbps AAC; dropping any
+            # one of them silently yields 128 kbps.  (--only-verified-results is
+            # deliberately absent: it only pre-filters candidates to YouTube
+            # Music catalog entries, discarding the whole "videos" search pass
+            # before scoring, which loses remixes and edits.  It has no effect on
+            # bitrate or stream format.)
             "--audio", "youtube-music",
             "--format", "m4a",
             "--bitrate", "disable",
-            "--only-verified-results",
+            # Pin sanitisation so _resolve_paths agrees with spotdl regardless of
+            # the user's global spotdl config.
+            "--restrict", RESTRICT_MODE,
             # Without the cookie file spotdl's yt-dlp is unauthenticated and
             # gets 128 kbps regardless of the premium gate passing.
             "--cookie-file", str(quality.COOKIE_FILE),
             "--archive", str(archive),
-            # The [track-id] suffix ties each staged file back to its Spotify
-            # metadata; it is stripped on promotion into the library.
-            "--output", str(staging_dir / "{artists} - {title} [{track-id}].{output-ext}"),
+            "--output", str(staging_dir / STAGING_TEMPLATE),
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        # Stop spotdl's console wrapping long lines, which splits the
+        # `Downloaded "name": url` pairs the source URLs are read from.
+        env={**os.environ, "COLUMNS": "1000"},
     )
     source_urls: dict[str, str] = {}
+    pending_name: str | None = None
     for line in process.stdout:
         line = line.rstrip()
         if not line:
             continue
         log(line)
+
         matched = _DOWNLOADED_RE.search(line)
         if matched:
             source_urls[matched.group("name")] = matched.group("url")
-    process.wait()
+            pending_name = None
+            continue
 
-    # Everything left in staging is unverified, including leftovers from a run
-    # that stopped early.
-    staged = _audio_files(staging_dir)
-    log(f"\nVerifying {len(staged)} downloaded file(s) ...")
+        wrapped = _DOWNLOADED_WRAP_RE.search(line)
+        if wrapped:
+            pending_name = wrapped.group("name")
+            continue
+
+        if pending_name:
+            url_only = _URL_ONLY_RE.match(line.strip())
+            if url_only:
+                source_urls[pending_name] = url_only.group("url")
+            pending_name = None
+    process.wait()
 
     promoted: list[Path] = []
     quarantined: list[tuple[str, str]] = []
+    not_downloaded: list[str] = []
+    handled: set[Path] = set()
     low_bitrate_streak = 0
     stopped_early = False
 
-    for path in staged:
-        matched  = _TRACK_ID_RE.match(path.stem)
-        track_id = matched.group("track_id") if matched else None
-        display  = matched.group("name") if matched else path.stem
-        info     = track_meta.get(track_id or "")
-        source   = source_urls.get(display) or source_urls.get(path.stem)
+    def _handle(path: Path, display: str, expected_duration, source, final: Path | None):
+        """Verify one staged file, then promote it or quarantine it."""
+        nonlocal low_bitrate_streak, stopped_early
+        handled.add(path)
 
-        reason, probe = quality.verify_download(path, info["duration"] if info else None)
+        reason, probe = quality.verify_download(path, expected_duration)
 
         if reason is None:
-            dest = download_dir / f"{display}{path.suffix}"
+            dest = final or (download_dir / path.name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists():
                 log(f"  ! replacing existing library file {dest.name}")
             os.replace(path, dest)
             promoted.append(dest)
-            if info and info.get("url"):
-                verified_urls.add(info["url"])
             log(f"  ✓ {display}")
             low_bitrate_streak = 0
-            continue
+            return True
 
         dest = quality.quarantine_file(path, quarantine_dir, reason, probe, source)
         quarantined.append((display, reason))
@@ -248,16 +318,69 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
         low_bitrate_streak = low_bitrate_streak + 1 if reason == "LOW_BITRATE" else 0
         if low_bitrate_streak >= LOW_BITRATE_STREAK_LIMIT:
             stopped_early = True
+        return False
+
+    log(f"\nVerifying {len(_audio_files(staging_dir))} downloaded file(s) ...")
+
+    # Walk the playlist rather than the directory: spotdl tells us exactly where
+    # each track landed, so the Spotify duration comes straight from its metadata
+    # and no filename parsing is involved.
+    for song in songs:
+        if stopped_early:
             break
+        display = _display_name(song)
+        source  = source_urls.get(display)
+        paths   = _resolve_paths(song, staging_dir, download_dir)
+
+        if paths is None:
+            log("  ! could not resolve spotdl's output path — falling back to a "
+                "directory scan for the remaining files")
+            break
+
+        expected, final_path = paths
+        staged_path = _find_staged(expected)
+        if staged_path is None:
+            not_downloaded.append(display)
+            continue
+        if staged_path.suffix != expected.suffix:
+            log(f"  ! {display} arrived as {staged_path.suffix}, not "
+                f"{expected.suffix}")
+            final_path = final_path.with_suffix(staged_path.suffix)
+
+        if _handle(staged_path, display, float(song["duration"]), source, final_path):
+            if song.get("url"):
+                verified_urls.add(song["url"])
+
+    # Safety net: anything in staging that no track claimed. Never leave a
+    # downloaded file to rot silently — that is what hid the last bug.
+    for path in _audio_files(staging_dir):
+        if stopped_early or path in handled:
+            continue
+        matched  = _TRACK_ID_RE.match(path.stem)
+        track_id = matched.group("track_id") if matched else None
+        display  = matched.group("name") if matched else path.stem
+        song     = next((s for s in songs if s.get("song_id") == track_id), None)
+        log(f"  ! unclaimed file in {STAGING_DIRNAME}/: {path.name}")
+        if _handle(
+            path,
+            display,
+            float(song["duration"]) if song else None,
+            source_urls.get(display) or source_urls.get(path.stem),
+            download_dir / f"{display}{path.suffix}",
+        ) and song and song.get("url"):
+            verified_urls.add(song["url"])
 
     # Only verified tracks are archived, so quarantined ones get another chance.
     archive.write_text("\n".join(sorted(verified_urls)) + "\n", encoding="utf-8")
 
     log("\n── Download summary ─────────────────────────────")
-    log(f"  Verified into library: {len(promoted)}")
-    log(f"  Quarantined:           {len(quarantined)}")
+    log(f"  Verified into library:       {len(promoted)}")
+    log(f"  Quarantined:                 {len(quarantined)}")
     for name, reason in quarantined:
         log(f"    • {name}  [{reason}]")
+    log(f"  Not found on YouTube Music:  {len(not_downloaded)}")
+    for name in not_downloaded:
+        log(f"    • {name}")
     if stopped_early:
         remaining = len(_audio_files(staging_dir))
         log(f"  Left unverified in {STAGING_DIRNAME}/: {remaining}")

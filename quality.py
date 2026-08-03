@@ -549,7 +549,9 @@ def verify_download(path: Path, expected_duration_s: float | None) -> tuple[str 
     except RuntimeError as exc:
         return "PROBE_FAILED", {"file_size": size, "error": str(exc)}
 
-    probe = {**probe, "file_size": size}
+    # Recorded up front so a sidecar quarantined by an earlier check still shows
+    # what duration was expected, rather than a bare null that reads as "unknown".
+    probe = {**probe, "file_size": size, "expected_duration": expected_duration_s}
     streams = probe.get("streams") or []
     if not streams:
         return "PROBE_FAILED", {**probe, "error": "no audio stream reported"}
@@ -592,7 +594,6 @@ def verify_download(path: Path, expected_duration_s: float | None) -> tuple[str 
     except (KeyError, TypeError, ValueError):
         return "PROBE_FAILED", {**probe, "error": "format duration missing or unparseable"}
 
-    probe["expected_duration"] = expected_duration_s
     if abs(actual - expected_duration_s) > DURATION_TOLERANCE_S:
         return "DURATION_MISMATCH", probe
 
