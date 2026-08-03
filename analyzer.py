@@ -8,6 +8,8 @@ Can also be run directly as a CLI:
 
 import argparse
 import json
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +28,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
+import quality
+
 # ── colour palette ────────────────────────────────────────────────────────────
 BG        = "#1a1a2e"
 PANEL_BG  = "#16213e"
@@ -37,6 +41,32 @@ WAVEFORM  = "#a8dadc"
 BEAT_LINE = "#457b9d"
 
 LogFn = Callable[[str], None]
+
+# ── download staging ──────────────────────────────────────────────────────────
+# spotdl writes into STAGING_DIRNAME; files only reach the library after passing
+# quality.verify_download.  Failures land in QUARANTINE_DIRNAME.
+STAGING_DIRNAME    = ".staging"
+QUARANTINE_DIRNAME = "quarantine"
+ARCHIVE_FILENAME   = ".spotdl-archive"
+
+# Three low-bitrate results in a row means the session lost Premium partway
+# through, not three unlucky tracks — stop rather than quarantining the rest of
+# the playlist one file at a time.
+LOW_BITRATE_STREAK_LIMIT = 3
+
+AUDIO_EXTS = {".mp3", ".m4a", ".opus", ".flac", ".wav"}
+
+# Staged filenames carry the Spotify track id so each file can be tied back to
+# its metadata; the suffix is stripped when the file is promoted.
+_TRACK_ID_RE  = re.compile(r"^(?P<name>.+) \[(?P<track_id>[A-Za-z0-9]{16,})\]$")
+_DOWNLOADED_RE = re.compile(r'Downloaded "(?P<name>.+)": (?P<url>\S+)')
+
+
+def _audio_files(directory: Path) -> list[Path]:
+    if not directory.exists():
+        return []
+    return sorted(p for p in directory.iterdir()
+                  if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
 
 
 def _ensure_ffmpeg(log: LogFn):
@@ -78,40 +108,168 @@ def _mark_analyzed(reports_dir: Path, filename: str, metadata: dict):
     _write_analyzed_tracks(reports_dir, analyzed)
 
 
+def _fetch_track_metadata(url: str, staging_dir: Path) -> dict[str, dict]:
+    """Ask spotdl for the playlist's Spotify metadata before downloading anything.
+
+    Returns {spotify_track_id: {"duration": seconds, "name": str, "url": str}}.
+    spotdl's Song.duration is Spotify's duration_ms floored to whole seconds,
+    which is comfortably inside the ±4 s tolerance used when verifying.
+    """
+    save_file = staging_dir / "playlist.spotdl"
+    proc = subprocess.run(
+        ["spotdl", "save", url, "--save-file", str(save_file)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0 or not save_file.exists():
+        detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        raise RuntimeError(
+            f"Could not read Spotify metadata for {url} (spotdl save exited "
+            f"{proc.returncode}). Track durations are required to verify "
+            f"downloads.\n{detail}"
+        )
+
+    raw = json.loads(save_file.read_text(encoding="utf-8"))
+    songs = raw.get("songs", []) if isinstance(raw, dict) else raw
+
+    meta: dict[str, dict] = {}
+    for song in songs:
+        track_id = song.get("song_id")
+        duration = song.get("duration")
+        if not track_id or not duration:
+            continue
+        artist = song.get("artist") or (song.get("artists") or [""])[0]
+        meta[track_id] = {
+            "duration": float(duration),
+            "name": f"{artist} - {song.get('name', '')}".strip(" -"),
+            "url": song.get("url", ""),
+        }
+    return meta
+
+
 def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[Path]:
-    """Download all tracks from a Spotify playlist URL using spotdl."""
+    """Download all tracks from a Spotify playlist URL using spotdl.
+
+    spotdl downloads into a staging directory; only files that pass
+    quality.verify_download are promoted into download_dir.  Failures are moved
+    to download_dir/quarantine with a .json sidecar and never returned.
+    """
     _ensure_ffmpeg(log)
     download_dir.mkdir(parents=True, exist_ok=True)
-    log(f"Starting download → {download_dir}")
+    staging_dir    = download_dir / STAGING_DIRNAME
+    quarantine_dir = download_dir / QUARANTINE_DIRNAME
+    staging_dir.mkdir(parents=True, exist_ok=True)
 
-    # Track which files existed before download
-    existing_files = set(
-        p for p in download_dir.iterdir()
-        if p.suffix.lower() in {".mp3", ".m4a", ".opus", ".flac", ".wav"}
-    ) if download_dir.exists() else set()
+    log("Reading Spotify track metadata ...")
+    track_meta = _fetch_track_metadata(url, staging_dir)
+    log(f"Got Spotify durations for {len(track_meta)} track(s).")
 
+    # The archive holds the Spotify URLs of tracks already verified and in the
+    # library, so they aren't re-downloaded.  Quarantined tracks stay out of it
+    # and are retried on the next run.
+    archive = download_dir / ARCHIVE_FILENAME
+    verified_urls: set[str] = set()
+    if archive.exists():
+        verified_urls = {
+            line.strip()
+            for line in archive.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+
+    log(f"Starting download → {staging_dir}")
     process = subprocess.Popen(
-        ["spotdl", url, "--output", str(download_dir)],
+        [
+            "spotdl", url,
+            # All four of these are required together for 256 kbps AAC.
+            # Dropping any one of them silently yields 128 kbps.
+            "--audio", "youtube-music",
+            "--format", "m4a",
+            "--bitrate", "disable",
+            "--only-verified-results",
+            # Without the cookie file spotdl's yt-dlp is unauthenticated and
+            # gets 128 kbps regardless of the premium gate passing.
+            "--cookie-file", str(quality.COOKIE_FILE),
+            "--archive", str(archive),
+            # The [track-id] suffix ties each staged file back to its Spotify
+            # metadata; it is stripped on promotion into the library.
+            "--output", str(staging_dir / "{artists} - {title} [{track-id}].{output-ext}"),
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
+    source_urls: dict[str, str] = {}
     for line in process.stdout:
         line = line.rstrip()
-        if line:
-            log(line)
+        if not line:
+            continue
+        log(line)
+        matched = _DOWNLOADED_RE.search(line)
+        if matched:
+            source_urls[matched.group("name")] = matched.group("url")
     process.wait()
 
-    # Only return newly downloaded files
-    all_audio_files = sorted(
-        p for p in download_dir.iterdir()
-        if p.suffix.lower() in {".mp3", ".m4a", ".opus", ".flac", ".wav"}
-    )
-    new_audio_files = [f for f in all_audio_files if f not in existing_files]
+    # Everything left in staging is unverified, including leftovers from a run
+    # that stopped early.
+    staged = _audio_files(staging_dir)
+    log(f"\nVerifying {len(staged)} downloaded file(s) ...")
 
-    log(f"Found {len(new_audio_files)} new audio file(s).")
-    return new_audio_files
+    promoted: list[Path] = []
+    quarantined: list[tuple[str, str]] = []
+    low_bitrate_streak = 0
+    stopped_early = False
+
+    for path in staged:
+        matched  = _TRACK_ID_RE.match(path.stem)
+        track_id = matched.group("track_id") if matched else None
+        display  = matched.group("name") if matched else path.stem
+        info     = track_meta.get(track_id or "")
+        source   = source_urls.get(display) or source_urls.get(path.stem)
+
+        reason, probe = quality.verify_download(path, info["duration"] if info else None)
+
+        if reason is None:
+            dest = download_dir / f"{display}{path.suffix}"
+            if dest.exists():
+                log(f"  ! replacing existing library file {dest.name}")
+            os.replace(path, dest)
+            promoted.append(dest)
+            if info and info.get("url"):
+                verified_urls.add(info["url"])
+            log(f"  ✓ {display}")
+            low_bitrate_streak = 0
+            continue
+
+        dest = quality.quarantine_file(path, quarantine_dir, reason, probe, source)
+        quarantined.append((display, reason))
+        log(f"  ✗ {reason}: {display}  →  {QUARANTINE_DIRNAME}/{dest.name}")
+
+        low_bitrate_streak = low_bitrate_streak + 1 if reason == "LOW_BITRATE" else 0
+        if low_bitrate_streak >= LOW_BITRATE_STREAK_LIMIT:
+            stopped_early = True
+            break
+
+    # Only verified tracks are archived, so quarantined ones get another chance.
+    archive.write_text("\n".join(sorted(verified_urls)) + "\n", encoding="utf-8")
+
+    log("\n── Download summary ─────────────────────────────")
+    log(f"  Verified into library: {len(promoted)}")
+    log(f"  Quarantined:           {len(quarantined)}")
+    for name, reason in quarantined:
+        log(f"    • {name}  [{reason}]")
+    if stopped_early:
+        remaining = len(_audio_files(staging_dir))
+        log(f"  Left unverified in {STAGING_DIRNAME}/: {remaining}")
+        raise quality.QualityGateError(
+            f"Stopped after {LOW_BITRATE_STREAK_LIMIT} consecutive LOW_BITRATE "
+            "results — the YouTube Music session is probably no longer Premium "
+            "(expired cookies, or the wrong Google account).\n"
+            f"Refresh cookies at {quality.COOKIE_FILE} and re-run; the "
+            f"{remaining} untouched file(s) are still in {staging_dir}."
+        )
+
+    return promoted
 
 
 def analyze_track(path: Path) -> dict:
@@ -361,6 +519,10 @@ def compute_chart_bounds() -> dict:
 
 def run_analysis(url: str, songs_dir: Path, reports_dir: Path, log: LogFn = print):
     """Full pipeline: download playlist, analyze each track, write PNG charts."""
+    # Raises QualityGateError before anything is fetched if 256 kbps AAC cannot
+    # be confirmed.  There is no bypass.
+    quality.ensure_premium_access(log)
+
     audio_files = download_playlist(url, songs_dir, log)
 
     if not audio_files:
@@ -394,12 +556,26 @@ def run_analysis(url: str, songs_dir: Path, reports_dir: Path, log: LogFn = prin
 # ── CLI entry point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Spotimine CLI analyzer")
-    parser.add_argument("url", help="Spotify playlist or track URL")
+    parser.add_argument("url", nargs="?", help="Spotify playlist or track URL")
     parser.add_argument("--songs-dir",   default="songs",          help="Where to save downloads")
     parser.add_argument("--reports-dir", default="static/reports", help="Where to save PNG charts")
     parser.add_argument("--skip-download", action="store_true",
                         help="Skip spotdl; analyze existing files in --songs-dir")
+    parser.add_argument("--check-premium", action="store_true",
+                        help="Only run the YouTube Music Premium gate, then exit")
     args = parser.parse_args()
+
+    if args.check_premium:
+        try:
+            quality.ensure_premium_access()
+        except quality.QualityGateError as exc:
+            print(f"\nPremium gate FAILED:\n{exc}", file=sys.stderr)
+            sys.exit(1)
+        print("\nPremium gate passed — 256 kbps AAC is available.")
+        sys.exit(0)
+
+    if not args.url and not args.skip_download:
+        parser.error("a Spotify URL is required unless --skip-download is given")
 
     songs_dir   = Path(args.songs_dir)
     reports_dir = Path(args.reports_dir)
@@ -421,6 +597,10 @@ if __name__ == "__main__":
             except Exception as exc:
                 print(f"  ✗ {path.name}: {exc}")
     else:
-        run_analysis(args.url, songs_dir, reports_dir)
+        try:
+            run_analysis(args.url, songs_dir, reports_dir)
+        except quality.QualityGateError as exc:
+            print(f"\n{exc}", file=sys.stderr)
+            sys.exit(1)
 
     print(f"\nDone. Charts saved to: {reports_dir.resolve()}")

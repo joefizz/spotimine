@@ -8,6 +8,10 @@ __pycache__/
 # Downloaded audio files
 songs/
 
+# YouTube Music session cookies and interactive-login browser profile —
+# these are credentials, never commit them
+.spotimine/
+
 # Generated chart reports
 static/reports/
 

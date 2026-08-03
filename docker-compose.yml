@@ -7,4 +7,10 @@ services:
       # Downloaded songs and generated charts persist across restarts
       - ./songs:/app/songs
       - ./static/reports:/app/static/reports
+      # YouTube Music cookies — the premium gate reads .spotimine/cookies.txt
+      - ./.spotimine:/app/.spotimine
+    environment:
+      # No display in a container, so the interactive login tier is skipped
+      # rather than attempted; refresh cookies on the host instead.
+      - SPOTIMINE_UNATTENDED=1
     restart: unless-stopped
