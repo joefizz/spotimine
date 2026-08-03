@@ -91,8 +91,12 @@ class QualityGateError(RuntimeError):
 # yt-dlp needs a JavaScript runtime to solve YouTube's signature challenge.
 # Without one it returns an empty format list, which is indistinguishable from
 # "this account has no Premium" unless you look for it specifically.
-# In yt-dlp's own order of preference; only deno is enabled by default.
-JS_RUNTIMES = ("deno", "node")
+#
+# Deno only. yt-dlp nominally supports node/bun/quickjs too, but node does not
+# actually solve the challenge even with the yt-dlp-ejs solver scripts installed
+# (verified against a real Premium session), so listing it here would only
+# produce a gate that passes its own check and then fails the probe.
+JS_RUNTIMES = ("deno",)
 
 
 def _find_js_runtime() -> tuple[str, str] | None:
@@ -142,12 +146,15 @@ def _require_binaries():
         raise QualityGateError(
             "No JavaScript runtime found (looked for "
             f"{' or '.join(JS_RUNTIMES)} on PATH, and spotdl's bundled Deno).\n"
-            "yt-dlp needs one to solve YouTube's signature challenge; without it "
-            "it returns an empty format list and Premium can never be "
+            "yt-dlp needs Deno to solve YouTube's signature challenge; without "
+            "it yt-dlp returns an empty format list and Premium can never be "
             "confirmed.\n"
             "Fix with either:\n"
-            "  spotdl --download-deno      (reuses spotdl's own copy)\n"
-            "  apt-get install -y nodejs   (or install Deno system-wide)"
+            "  spotdl --download-deno    (reuses the copy spotdl downloads)\n"
+            "  install Deno system-wide  (https://deno.com — in Docker, "
+            "COPY --from=denoland/deno:bin /deno /usr/local/bin/deno)\n"
+            "Node is not a substitute: yt-dlp lists it as supported but it does "
+            "not solve the challenge in practice."
         )
 
 
