@@ -3,6 +3,10 @@ services:
     build: .
     ports:
       - "3200:5000"
+      # Soulseek incoming connections. Without an open inbound port you can only
+      # reach peers who have one open themselves, which shrinks the pool the
+      # second pass depends on. Forward this at your router too.
+      - "49998:49998"
     volumes:
       # Downloaded songs and generated charts persist across restarts
       - ./songs:/app/songs
@@ -19,4 +23,12 @@ services:
       # No display in a container, so the interactive login tier is skipped
       # rather than attempted; refresh cookies on the host instead.
       - SPOTIMINE_UNATTENDED=1
+      # Soulseek credentials for the second pass. Free account, created on first
+      # login with an unused name. Leave unset and the pass skips itself.
+      # Put the real values in a .env file beside this one, never in here.
+      - SPOTIMINE_SLSK_USERNAME=${SPOTIMINE_SLSK_USERNAME:-}
+      - SPOTIMINE_SLSK_PASSWORD=${SPOTIMINE_SLSK_PASSWORD:-}
+      # Transcode detection records its verdict without rejecting until this is
+      # set to 1. Review what it would have rejected first.
+      - SPOTIMINE_SPECTRAL_ENFORCE=${SPOTIMINE_SPECTRAL_ENFORCE:-0}
     restart: unless-stopped

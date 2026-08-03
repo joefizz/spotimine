@@ -29,6 +29,7 @@ import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
 import quality
+import soulseek
 
 # ── colour palette ────────────────────────────────────────────────────────────
 BG        = "#1a1a2e"
@@ -53,6 +54,10 @@ LogFn = Callable[[str], None]
 STAGING_DIRNAME    = "staging"
 QUARANTINE_DIRNAME = "quarantine"
 ARCHIVE_FILENAME   = "spotdl-archive"
+
+# The Soulseek pass stages separately, so the two sources cannot collide over a
+# filename and the staging sweep for one never picks up the other's partials.
+SOULSEEK_STAGING_DIRNAME = "staging-soulseek"
 
 # Filename templates.  Staged files carry the Spotify track id so two tracks with
 # the same artist and title cannot collide; the library name drops it.
@@ -145,6 +150,65 @@ def _mark_analyzed(reports_dir: Path, filename: str, metadata: dict):
     _write_analyzed_tracks(reports_dir, analyzed)
 
 
+class _Verifier:
+    """Verify staged files, then promote them to the library or quarantine them.
+
+    Shared by every download source so the promotion rules cannot drift apart,
+    and so a file from any source has to clear the same bar.
+    """
+
+    def __init__(self, library_dir: Path, quarantine_dir: Path, log: LogFn):
+        self.library_dir    = library_dir
+        self.quarantine_dir = quarantine_dir
+        self.log            = log
+        self.promoted: list[Path] = []
+        self.quarantined: list[tuple[str, str]] = []
+        self.handled: set[Path] = set()
+        self.low_bitrate_streak = 0
+        self.stopped_early = False
+
+    def handle(
+        self,
+        path: Path,
+        display: str,
+        expected_duration: float | None,
+        source: str | None,
+        final: Path | None = None,
+        profile: str = quality.DEFAULT_PROFILE,
+        track_streak: bool = True,
+    ) -> bool:
+        """Verify one staged file. Returns True if it reached the library."""
+        self.handled.add(path)
+
+        reason, probe = quality.verify_download(path, expected_duration, profile=profile)
+
+        if reason is None:
+            dest = final or (self.library_dir / path.name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if dest.exists():
+                self.log(f"  ! replacing existing library file {dest.name}")
+            os.replace(path, dest)
+            self.promoted.append(dest)
+            self.log(f"  ✓ {display}")
+            self.low_bitrate_streak = 0
+            return True
+
+        dest = quality.quarantine_file(path, self.quarantine_dir, reason, probe, source)
+        self.quarantined.append((display, reason))
+        self.log(f"  ✗ {reason}: {display}  →  {QUARANTINE_DIRNAME}/{dest.name}")
+
+        # The streak rule is a statement about the YouTube Music session dying
+        # mid-run. On a peer-to-peer source three bad rips in a row says nothing
+        # about cookies, so callers there opt out.
+        if track_streak:
+            self.low_bitrate_streak = (
+                self.low_bitrate_streak + 1 if reason == "LOW_BITRATE" else 0
+            )
+            if self.low_bitrate_streak >= LOW_BITRATE_STREAK_LIMIT:
+                self.stopped_early = True
+        return False
+
+
 def _fetch_track_metadata(url: str, staging_dir: Path) -> list[dict]:
     """Ask spotdl for the playlist's Spotify metadata before downloading anything.
 
@@ -199,6 +263,64 @@ def _resolve_paths(song: dict, staging_dir: Path, library_dir: Path) -> tuple[Pa
         return staged, final
     except Exception:
         return None
+
+
+def _soulseek_pass(
+    songs: list[dict],
+    download_dir: Path,
+    verifier: "_Verifier",
+    log: LogFn,
+) -> list[tuple[Path, dict]]:
+    """Try Soulseek for tracks YouTube Music could not supply at 256 kbps.
+
+    Returns [(library_path, song)] for tracks that made it. Files go through the
+    same verifier, under the "soulseek" profile — a peer's file has to clear the
+    bar just as a YouTube Music one does.
+    """
+    ok, reason = soulseek.is_configured()
+    if not ok:
+        log(f"\nSoulseek pass skipped: {reason}")
+        return []
+
+    log(f"\n── Soulseek pass ────────────────────────────────")
+    log(f"  {len(songs)} track(s) YouTube Music could not supply at 256 kbps")
+
+    staging = download_dir / SOULSEEK_STAGING_DIRNAME
+    results = soulseek.download(songs, staging, log)
+    if not results:
+        return []
+
+    promoted: list[tuple[Path, dict]] = []
+    for song in songs:
+        artist  = song.get("artist") or (song.get("artists") or [""])[0]
+        display = _display_name(song)
+        result  = results.get(
+            (artist.strip().casefold(), str(song.get("name", "")).strip().casefold())
+        )
+        if not result or not result.get("path"):
+            continue
+
+        staged = Path(result["path"])
+        if not staged.exists():
+            log(f"  ! {display}: sockseek reported {staged} but it is not there")
+            continue
+
+        before = len(verifier.promoted)
+        # track_streak=False: a run of bad rips from peers says nothing about the
+        # YouTube Music session, so it must not trigger the cookie-expiry abort.
+        verifier.handle(
+            staged,
+            display,
+            float(song["duration"]),
+            result.get("provenance"),
+            download_dir / f"{display}{staged.suffix}",
+            profile="soulseek",
+            track_streak=False,
+        )
+        if len(verifier.promoted) > before:
+            promoted.append((verifier.promoted[-1], song))
+
+    return promoted
 
 
 def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[Path]:
@@ -286,39 +408,9 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             pending_name = None
     process.wait()
 
-    promoted: list[Path] = []
-    quarantined: list[tuple[str, str]] = []
+    verifier = _Verifier(download_dir, quarantine_dir, log)
     not_downloaded: list[str] = []
-    handled: set[Path] = set()
-    low_bitrate_streak = 0
-    stopped_early = False
-
-    def _handle(path: Path, display: str, expected_duration, source, final: Path | None):
-        """Verify one staged file, then promote it or quarantine it."""
-        nonlocal low_bitrate_streak, stopped_early
-        handled.add(path)
-
-        reason, probe = quality.verify_download(path, expected_duration)
-
-        if reason is None:
-            dest = final or (download_dir / path.name)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                log(f"  ! replacing existing library file {dest.name}")
-            os.replace(path, dest)
-            promoted.append(dest)
-            log(f"  ✓ {display}")
-            low_bitrate_streak = 0
-            return True
-
-        dest = quality.quarantine_file(path, quarantine_dir, reason, probe, source)
-        quarantined.append((display, reason))
-        log(f"  ✗ {reason}: {display}  →  {QUARANTINE_DIRNAME}/{dest.name}")
-
-        low_bitrate_streak = low_bitrate_streak + 1 if reason == "LOW_BITRATE" else 0
-        if low_bitrate_streak >= LOW_BITRATE_STREAK_LIMIT:
-            stopped_early = True
-        return False
+    satisfied_ids: set[str] = set()
 
     log(f"\nVerifying {len(_audio_files(staging_dir))} downloaded file(s) ...")
 
@@ -326,7 +418,7 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     # each track landed, so the Spotify duration comes straight from its metadata
     # and no filename parsing is involved.
     for song in songs:
-        if stopped_early:
+        if verifier.stopped_early:
             break
         display = _display_name(song)
         source  = source_urls.get(display)
@@ -347,41 +439,69 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
                 f"{expected.suffix}")
             final_path = final_path.with_suffix(staged_path.suffix)
 
-        if _handle(staged_path, display, float(song["duration"]), source, final_path):
+        if verifier.handle(staged_path, display, float(song["duration"]),
+                           source, final_path):
+            satisfied_ids.add(song["song_id"])
             if song.get("url"):
                 verified_urls.add(song["url"])
 
     # Safety net: anything in staging that no track claimed. Never leave a
     # downloaded file to rot silently — that is what hid the last bug.
     for path in _audio_files(staging_dir):
-        if stopped_early or path in handled:
+        if verifier.stopped_early or path in verifier.handled:
             continue
         matched  = _TRACK_ID_RE.match(path.stem)
         track_id = matched.group("track_id") if matched else None
         display  = matched.group("name") if matched else path.stem
         song     = next((s for s in songs if s.get("song_id") == track_id), None)
         log(f"  ! unclaimed file in {STAGING_DIRNAME}/: {path.name}")
-        if _handle(
+        if verifier.handle(
             path,
             display,
             float(song["duration"]) if song else None,
             source_urls.get(display) or source_urls.get(path.stem),
             download_dir / f"{display}{path.suffix}",
-        ) and song and song.get("url"):
-            verified_urls.add(song["url"])
+        ) and song:
+            satisfied_ids.add(song["song_id"])
+            if song.get("url"):
+                verified_urls.add(song["url"])
+
+    from_ytmusic = len(verifier.promoted)
+
+    # Second pass: anything YouTube Music could not supply at 256 kbps. Skipped
+    # entirely when the run already stopped on a suspected cookie expiry — the
+    # right move then is to fix the cookies, not to go hunting elsewhere.
+    unsatisfied = [s for s in songs if s["song_id"] not in satisfied_ids]
+    if unsatisfied and not verifier.stopped_early:
+        for promoted_path, song in _soulseek_pass(
+            unsatisfied, download_dir, verifier, log
+        ):
+            satisfied_ids.add(song["song_id"])
+            if song.get("url"):
+                verified_urls.add(song["url"])
 
     # Only verified tracks are archived, so quarantined ones get another chance.
+    # A track satisfied from Soulseek is archived too: it is in the library, so
+    # spotdl should not waste a download re-fetching a 128k copy next run.
     archive.write_text("\n".join(sorted(verified_urls)) + "\n", encoding="utf-8")
 
+    still_missing = [
+        _display_name(s) for s in songs if s["song_id"] not in satisfied_ids
+    ]
+    from_soulseek = len(verifier.promoted) - from_ytmusic
+
     log("\n── Download summary ─────────────────────────────")
-    log(f"  Verified into library:       {len(promoted)}")
-    log(f"  Quarantined:                 {len(quarantined)}")
-    for name, reason in quarantined:
+    log(f"  Verified from YouTube Music: {from_ytmusic}")
+    if from_soulseek:
+        log(f"  Verified from Soulseek:      {from_soulseek}")
+    log(f"  Quarantined:                 {len(verifier.quarantined)}")
+    for name, reason in verifier.quarantined:
         log(f"    • {name}  [{reason}]")
-    log(f"  Not found on YouTube Music:  {len(not_downloaded)}")
-    for name in not_downloaded:
+    log(f"  Still unavailable:           {len(still_missing)}")
+    for name in still_missing:
         log(f"    • {name}")
-    if stopped_early:
+
+    if verifier.stopped_early:
         remaining = len(_audio_files(staging_dir))
         log(f"  Left unverified in {STAGING_DIRNAME}/: {remaining}")
         raise quality.QualityGateError(
@@ -392,7 +512,7 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             f"{remaining} untouched file(s) are still in {staging_dir}."
         )
 
-    return promoted
+    return verifier.promoted
 
 
 def analyze_track(path: Path) -> dict:
