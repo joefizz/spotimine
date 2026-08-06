@@ -59,6 +59,51 @@ ARCHIVE_FILENAME   = "spotdl-archive"
 # filename and the staging sweep for one never picks up the other's partials.
 SOULSEEK_STAGING_DIRNAME = "staging-soulseek"
 
+# Every downloaded file is kept, whether or not it meets the quality bar, and its
+# measured properties are recorded here so the library can show what each track
+# actually is. Lives with the songs because it describes them.
+QUALITY_FILENAME = "quality.json"
+
+
+def _read_quality(library_dir: Path) -> dict:
+    path = library_dir / QUALITY_FILENAME
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _record_quality(library_dir: Path, filename: str, reason: str | None,
+                    probe: dict, source: str | None) -> dict:
+    """Store what a library file measured as, keyed by its filename."""
+    stream = (probe.get("streams") or [{}])[0]
+    spectral = probe.get("spectral") or {}
+
+    entry = {
+        "ok":          reason is None,
+        "verified":    True,
+        "reason":      reason,
+        "codec":       stream.get("codec_name"),
+        "bitrate":     quality.effective_bitrate(probe),
+        "sample_rate": stream.get("sample_rate"),
+        "channels":    stream.get("channels"),
+        "lossless":    bool(probe.get("lossless")),
+        "profile":     probe.get("profile"),
+        "source":      source,
+        "spectral":    spectral.get("verdict"),
+        "spectral_detail": spectral.get("detail"),
+        "checked_at":  datetime.now().isoformat(timespec="seconds"),
+    }
+
+    records = _read_quality(library_dir)
+    records[filename] = entry
+    (library_dir / QUALITY_FILENAME).write_text(
+        json.dumps(records, indent=2), encoding="utf-8"
+    )
+    return entry
+
 # Filename templates.  Staged files carry the Spotify track id so two tracks with
 # the same artist and title cannot collide; the library name drops it.
 STAGING_TEMPLATE = "{artists} - {title} [{track-id}].{output-ext}"
@@ -151,18 +196,22 @@ def _mark_analyzed(reports_dir: Path, filename: str, metadata: dict):
 
 
 class _Verifier:
-    """Verify staged files, then promote them to the library or quarantine them.
+    """Move staged files into the library, recording what each one measured as.
 
-    Shared by every download source so the promotion rules cannot drift apart,
-    and so a file from any source has to clear the same bar.
+    Every downloaded file is kept. Files that miss the quality bar are flagged
+    rather than discarded, so the library shows what a track actually is and you
+    can decide what to do about it.
+
+    Shared by every download source so the rules cannot drift apart, and so a
+    file from any source is measured the same way.
     """
 
     def __init__(self, library_dir: Path, quarantine_dir: Path, log: LogFn):
         self.library_dir    = library_dir
-        self.quarantine_dir = quarantine_dir
+        self.quarantine_dir = quarantine_dir      # legacy runs may have left files here
         self.log            = log
         self.promoted: list[Path] = []
-        self.quarantined: list[tuple[str, str]] = []
+        self.flagged: list[tuple[str, str]] = []
         self.handled: set[Path] = set()
         self.low_bitrate_streak = 0
         self.stopped_early = False
@@ -177,25 +226,34 @@ class _Verifier:
         profile: str = quality.DEFAULT_PROFILE,
         track_streak: bool = True,
     ) -> bool:
-        """Verify one staged file. Returns True if it reached the library."""
+        """Move one staged file into the library. Returns whether it passed.
+
+        A False return does not mean the file was thrown away — it means the file
+        is in the library carrying a flag. Callers use the return value to decide
+        whether to keep looking for a better copy.
+        """
         self.handled.add(path)
 
         reason, probe = quality.verify_download(path, expected_duration, profile=profile)
 
+        dest = final or (self.library_dir / path.name)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            self.log(f"  ! replacing existing library file {dest.name}")
+        os.replace(path, dest)
+        self.promoted.append(dest)
+
+        entry = _record_quality(self.library_dir, dest.name, reason, probe, source)
+        rate = f"{entry['bitrate'] // 1000}k" if entry.get("bitrate") else "?"
+        codec = entry.get("codec") or "?"
+
         if reason is None:
-            dest = final or (self.library_dir / path.name)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if dest.exists():
-                self.log(f"  ! replacing existing library file {dest.name}")
-            os.replace(path, dest)
-            self.promoted.append(dest)
-            self.log(f"  ✓ {display}")
+            self.log(f"  ✓ {display}  [{codec} {rate}]")
             self.low_bitrate_streak = 0
             return True
 
-        dest = quality.quarantine_file(path, self.quarantine_dir, reason, probe, source)
-        self.quarantined.append((display, reason))
-        self.log(f"  ✗ {reason}: {display}  →  {QUARANTINE_DIRNAME}/{dest.name}")
+        self.flagged.append((display, reason))
+        self.log(f"  ⚠ {display}  [{codec} {rate}] kept and flagged {reason}")
 
         # The streak rule is a statement about the YouTube Music session dying
         # mid-run. On a peer-to-peer source three bad rips in a row says nothing
@@ -207,6 +265,42 @@ class _Verifier:
             if self.low_bitrate_streak >= LOW_BITRATE_STREAK_LIMIT:
                 self.stopped_early = True
         return False
+
+    def adopt_quarantined(self) -> int:
+        """Bring files quarantined by earlier runs back into the library.
+
+        Those runs discarded anything that missed the bar; the library now keeps
+        and flags instead, so leaving them stranded would be inconsistent.
+        """
+        if not self.quarantine_dir.exists():
+            return 0
+
+        adopted = 0
+        for path in _audio_files(self.quarantine_dir):
+            sidecar = path.with_suffix(path.suffix + ".json")
+            source = None
+            expected = None
+            if sidecar.exists():
+                try:
+                    car = json.loads(sidecar.read_text(encoding="utf-8"))
+                    source = car.get("source_url")
+                    expected = (car.get("ffprobe") or {}).get("expected_duration")
+                except Exception:
+                    pass
+            # Quarantined files kept their staged name, so strip the [track-id]
+            # to match library naming.
+            matched = _TRACK_ID_RE.match(path.stem)
+            display = matched.group("name") if matched else path.stem
+
+            # Re-measure rather than trusting the old record.
+            self.log(f"  adopting previously quarantined {display}")
+            self.handle(path, display, expected, source,
+                        self.library_dir / f"{display}{path.suffix}",
+                        track_streak=False)
+            if sidecar.exists():
+                sidecar.unlink()
+            adopted += 1
+        return adopted
 
 
 def _fetch_track_metadata(url: str, staging_dir: Path) -> list[dict]:
@@ -305,10 +399,13 @@ def _soulseek_pass(
             log(f"  ! {display}: sockseek reported {staged} but it is not there")
             continue
 
-        before = len(verifier.promoted)
         # track_streak=False: a run of bad rips from peers says nothing about the
         # YouTube Music session, so it must not trigger the cookie-expiry abort.
-        verifier.handle(
+        #
+        # Only a *passing* file counts as satisfying the track. A flagged one is
+        # kept in the library but stays unsatisfied, so it is not archived and a
+        # later run can still replace it with something better.
+        if verifier.handle(
             staged,
             display,
             float(song["duration"]),
@@ -316,8 +413,7 @@ def _soulseek_pass(
             download_dir / f"{display}{staged.suffix}",
             profile="soulseek",
             track_streak=False,
-        )
-        if len(verifier.promoted) > before:
+        ):
             promoted.append((verifier.promoted[-1], song))
 
     return promoted
@@ -412,6 +508,10 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     not_downloaded: list[str] = []
     satisfied_ids: set[str] = set()
 
+    adopted = verifier.adopt_quarantined()
+    if adopted:
+        log(f"Adopted {adopted} file(s) quarantined by an earlier run.")
+
     log(f"\nVerifying {len(_audio_files(staging_dir))} downloaded file(s) ...")
 
     # Walk the playlist rather than the directory: spotdl tells us exactly where
@@ -490,21 +590,21 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     ]
     from_soulseek = len(verifier.promoted) - from_ytmusic
 
-    # A quarantined track is also an unavailable one, so listing both in full
-    # reads as double-counting. Lead with an accounting that reconciles against
-    # the playlist, then break the shortfall down with each name appearing once.
-    quarantined_names = {name for name, _ in verifier.quarantined}
-    never_found = [n for n in still_missing if n not in quarantined_names]
+    # Every download is kept, so "in library" counts flagged files too. Report
+    # the flags separately from the tracks that never arrived at all, with each
+    # name appearing once.
+    flagged_names = {name for name, _ in verifier.flagged}
+    never_found = [n for n in still_missing if n not in flagged_names]
 
     log("\n── Download summary ─────────────────────────────")
     log(f"  {len(songs)} track(s): {len(verifier.promoted)} in library, "
-        f"{len(still_missing)} unavailable")
+        f"{len(never_found)} not downloaded")
     log(f"    from YouTube Music:    {from_ytmusic}")
     if from_soulseek:
         log(f"    from Soulseek:         {from_soulseek}")
-    if verifier.quarantined:
-        log(f"  Rejected after download: {len(verifier.quarantined)}")
-        for name, reason in verifier.quarantined:
+    if verifier.flagged:
+        log(f"  Kept but flagged: {len(verifier.flagged)}")
+        for name, reason in verifier.flagged:
             log(f"    • {name}  [{reason}]")
     if never_found:
         log(f"  Never found: {len(never_found)}")

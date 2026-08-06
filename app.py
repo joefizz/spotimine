@@ -5,12 +5,14 @@ Run:  python app.py
 """
 
 import json
+import os
 import queue
 import threading
 import uuid
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template, request, send_from_directory
+from flask import (Flask, Response, after_this_request, jsonify, render_template,
+                   request, send_file, send_from_directory)
 
 import quality
 
@@ -45,6 +47,58 @@ def _get_chart_bounds() -> dict:
 
 def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in " -_" else "_" for c in name)
+
+
+def _read_quality() -> dict:
+    """Measured properties per library file, written by the download pass."""
+    path = SONGS_DIR / "quality.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _measure_unrecorded(records: dict) -> dict:
+    """Fill in measurements for library files that have no record yet.
+
+    Files that predate verification, or were added by hand, still deserve to show
+    their real codec and bitrate. They get facts but no verdict: without Spotify's
+    duration there is nothing to judge them against, and inventing a pass or fail
+    would be worse than admitting they were never checked.
+
+    Results are cached in quality.json, so this costs one ffprobe per new file
+    rather than one per page load.
+    """
+    fresh = {}
+    for f in SONGS_DIR.iterdir():
+        if f.suffix.lower() not in AUDIO_EXTS or f.name in records:
+            continue
+        try:
+            probe = quality.probe_audio(f)
+            probe["file_size"] = f.stat().st_size
+            stream = (probe.get("streams") or [{}])[0]
+            fresh[f.name] = {
+                "ok": None,
+                "verified": False,
+                "reason": None,
+                "codec": stream.get("codec_name"),
+                "bitrate": quality.effective_bitrate(probe),
+                "sample_rate": stream.get("sample_rate"),
+                "channels": stream.get("channels"),
+                "lossless": stream.get("codec_name") in quality.LOSSLESS_CODECS,
+                "source": None,
+            }
+        except Exception:
+            fresh[f.name] = {"ok": None, "verified": False, "reason": None,
+                             "codec": None, "bitrate": None}
+
+    if fresh:
+        records = {**records, **fresh}
+        (SONGS_DIR / "quality.json").write_text(
+            json.dumps(records, indent=2), encoding="utf-8")
+    return records
 
 
 # ── chart helpers ─────────────────────────────────────────────────────────────
@@ -169,6 +223,7 @@ def list_songs():
         chart_index[png.stem] = {"chart_file": png.name, **meta}
 
     all_tags = _read_tags()
+    all_quality = _measure_unrecorded(_read_quality())
     songs = []
     for f in sorted(SONGS_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         if f.suffix.lower() not in AUDIO_EXTS:
@@ -182,6 +237,9 @@ def list_songs():
             "tempo":      info.get("tempo"),
             "key":        info.get("key"),
             "tags":       all_tags.get(f.name, []),
+            # What the file actually measured as, so a flagged track is visible
+            # in the listing rather than only in a run log.
+            "quality":    all_quality.get(f.name),
         })
     return jsonify(songs)
 
@@ -209,6 +267,12 @@ def delete_song(filename: str):
         p = REPORTS_DIR / f"{safe}{ext}"
         if p.exists():
             p.unlink()
+    # Drop its quality record too, so a re-download is measured afresh rather
+    # than inheriting the old verdict.
+    records = _read_quality()
+    if records.pop(filename, None) is not None:
+        (SONGS_DIR / "quality.json").write_text(
+            json.dumps(records, indent=2), encoding="utf-8")
     return jsonify({"ok": True})
 
 
@@ -408,6 +472,60 @@ def delete_playlist(pl_id: str):
     pls = [p for p in _read_playlists() if p["id"] != pl_id]
     _write_playlists(pls)
     return jsonify({"ok": True})
+
+
+@app.route("/playlists/<pl_id>/download")
+def download_playlist_audio(pl_id: str):
+    """Zip every audio file in a class, numbered in running order."""
+    import tempfile
+    import zipfile
+
+    pl = next((p for p in _read_playlists() if p["id"] == pl_id), None)
+    if not pl:
+        return jsonify({"error": "not found"}), 404
+
+    wanted = []
+    missing = []
+    for position, track in enumerate(pl.get("tracks", []), start=1):
+        if isinstance(track, str):
+            track = {"file": track}
+        # Playlist entries are user-supplied, so take only the bare filename —
+        # never let one reach outside the songs directory.
+        name = Path(track.get("file", "")).name
+        path = SONGS_DIR / name
+        if name and path.is_file():
+            wanted.append((position, path))
+        elif name:
+            missing.append(name)
+
+    if not wanted:
+        return jsonify({"error": "no audio files found for this class"}), 404
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    tmp.close()
+    # Stored, not deflated: audio is already compressed, so deflating spends CPU
+    # for essentially no saving.
+    with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
+        for position, path in wanted:
+            zf.write(path, arcname=f"{position:02d} - {path.name}")
+        if missing:
+            zf.writestr(
+                "MISSING.txt",
+                "These tracks are in the class but not in the library:\n\n"
+                + "\n".join(f"  {n}" for n in missing) + "\n",
+            )
+
+    @after_this_request
+    def _cleanup(response):
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
+        return response
+
+    safe = _safe_name(pl["name"]).strip() or "class"
+    return send_file(tmp.name, mimetype="application/zip",
+                     as_attachment=True, download_name=f"{safe}.zip")
 
 
 @app.route("/playlists/<pl_id>/export")

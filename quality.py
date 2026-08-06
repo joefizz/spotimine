@@ -790,6 +790,27 @@ def analyse_spectrum(path: Path) -> dict:
     return best
 
 
+def effective_bitrate(probe: dict) -> int | None:
+    """The measured bitrate, derived from size and duration when absent.
+
+    ffprobe often reports no stream bit_rate for FLAC, but a real number is what
+    makes a library listing useful, so compute it rather than showing nothing.
+    """
+    stream = (probe.get("streams") or [{}])[0]
+    try:
+        return int(stream["bit_rate"])
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        size = int(probe["file_size"])
+        duration = float(probe["format"]["duration"])
+        if duration > 0:
+            return int(size * 8 / duration)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        pass
+    return None
+
+
 def verify_download(
     path: Path,
     expected_duration_s: float | None,

@@ -118,6 +118,14 @@
   .btn-del:hover { background:#2a0d14; color:var(--accent); }
   .empty-row td { color:var(--muted); font-style:italic; text-align:center; padding:2rem; }
 
+  /* ── quality badge ── */
+  .cell-quality { white-space:nowrap; }
+  .q-badge { display:inline-flex; align-items:center; gap:.35rem; padding:.18rem .5rem; border-radius:5px; font-size:.74rem; font-weight:700; letter-spacing:.3px; cursor:help; }
+  .q-ok  { background:rgba(78,205,196,.14); color:var(--teal); border:1px solid rgba(78,205,196,.35); }
+  .q-bad { background:rgba(233,69,96,.13); color:var(--accent2); border:1px solid rgba(233,69,96,.4); }
+  .q-unknown { background:#1e2a40; color:var(--muted); border:1px solid #2a3a50; }
+  .q-reason { font-size:.66rem; opacity:.85; font-weight:600; }
+
   /* ── tags in table ── */
   .tags-cell { display:flex; flex-wrap:wrap; gap:.3rem; align-items:center; min-width:160px; }
   .tag-chip { display:inline-flex; align-items:center; gap:.3rem; padding:.18rem .52rem; border-radius:20px; font-size:.72rem; font-weight:700; letter-spacing:.3px; cursor:default; }
@@ -333,13 +341,14 @@
               <th onclick="toggleSort('tempo')">BPM <span class="sort-indicator"></span></th>
               <th onclick="toggleSort('key')">Key <span class="sort-indicator"></span></th>
               <th onclick="toggleSort('duration')">Duration <span class="sort-indicator"></span></th>
+              <th onclick="toggleSort('bitrate')">Quality <span class="sort-indicator"></span></th>
               <th>Tags</th>
               <th>Class</th>
               <th>Actions</th>
             </tr>
           </thead>
           <tbody id="songs-tbody">
-            <tr class="empty-row"><td colspan="6">No songs downloaded yet.</td></tr>
+            <tr class="empty-row"><td colspan="8">No songs downloaded yet.</td></tr>
           </tbody>
         </table>
       </section>
@@ -383,6 +392,7 @@
         <div class="export-bar" id="export-bar" style="display:none">
           <span class="pl-stats" id="pl-stats"></span>
           <div class="export-btns">
+            <button class="btn-export btn-export-audio" onclick="downloadClassAudio()">⬇ All audio (.zip)</button>
             <button class="btn-export" onclick="exportPlaylist('csv')">⬇ CSV (for Spotify)</button>
             <button class="btn-export" onclick="exportPlaylist('json')">⬇ JSON</button>
             <button class="btn-export" onclick="exportPlaylist('markdown')">⬇ Markdown</button>
@@ -500,6 +510,12 @@ function sortSongs(songs, column, ascending) {
       case 'tempo': aVal = a.tempo || 0; bVal = b.tempo || 0; break;
       case 'key': aVal = (a.key || '').toLowerCase(); bVal = (b.key || '').toLowerCase(); break;
       case 'duration': aVal = a.duration || 0; bVal = b.duration || 0; break;
+      // Sorting by quality puts flagged tracks together: failures rank below any
+      // passing file regardless of bitrate, so they surface as a group.
+      case 'bitrate':
+        aVal = (a.quality && a.quality.ok ? 1e9 : 0) + ((a.quality && a.quality.bitrate) || 0);
+        bVal = (b.quality && b.quality.ok ? 1e9 : 0) + ((b.quality && b.quality.bitrate) || 0);
+        break;
       default: return 0;
     }
     if (aVal < bVal) return ascending ? -1 : 1;
@@ -513,7 +529,7 @@ function renderSongs(songs) {
   const tbody = document.getElementById('songs-tbody');
   document.getElementById('songs-count').textContent = songs.length;
   if (!songs.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="6">No songs downloaded yet.</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No songs downloaded yet.</td></tr>';
     return;
   }
 
@@ -529,6 +545,7 @@ function renderSongs(songs) {
       <td class="cell-muted">${s.tempo ? s.tempo.toFixed(1) : '—'}</td>
       <td class="cell-muted">${s.key || '—'}</td>
       <td class="cell-muted">${s.duration ? fmtTime(s.duration) : '—'}</td>
+      <td class="cell-quality">${renderQuality(s.quality)}</td>
       <td>
         <div class="tags-cell" id="tags-${esc(s.file)}">
           ${renderTagChips(s.tags || [])}
@@ -555,6 +572,50 @@ function renderSongs(songs) {
       </td>
     </tr>
   `).join('');
+}
+
+// Failure reasons in plain language — the code name alone doesn't say what to do.
+const QUALITY_REASONS = {
+  LOW_BITRATE:         'below 256 kbps — only a low-quality source was available',
+  WRONG_CODEC:         'unexpected codec for this source',
+  BAD_SAMPLE_RATE:     'unusual sample rate',
+  NOT_STEREO:          'not stereo',
+  TRUNCATED:           'file is truncated or tiny — probably an incomplete download',
+  DURATION_MISMATCH:   'length differs from Spotify — may be a different recording, edit or remix',
+  PROBE_FAILED:        'could not be read reliably by ffprobe',
+  NO_SPOTIFY_DURATION: 'no Spotify duration to compare against',
+  TRANSCODE_SUSPECTED: 'looks re-encoded from a lower bitrate',
+};
+
+function renderQuality(q) {
+  if (!q) return '<span class="cell-muted">—</span>';
+  const rate = q.bitrate ? Math.round(q.bitrate / 1000) + 'k' : '?';
+  const codec = (q.codec || '').toUpperCase();
+  const label = `${codec} ${rate}`.trim();
+
+  // Never went through verification (predates it, or added by hand): show the
+  // facts without a verdict rather than implying one.
+  if (q.verified === false) {
+    return `<span class="q-badge q-unknown" title="Measured but never verified `
+         + `— downloaded before quality checks existed, or added manually">`
+         + `${esc(label)}</span>`;
+  }
+
+  if (q.ok) {
+    // Lossless is exempt from the bitrate floor, so say so — a well-compressed
+    // FLAC can measure low without being low quality.
+    const kind = q.lossless
+      ? 'Lossless — bitrate is informational, the floor does not apply'
+      : 'Passed all checks';
+    const note = q.spectral === 'suspect'
+      ? ' · spectral check flagged this as possibly re-encoded' : '';
+    const tag = q.lossless ? ' lossless' : '';
+    return `<span class="q-badge q-ok" title="${kind}${note}">${esc(label)}`
+         + `${tag ? `<span class="q-reason">${tag.trim()}</span>` : ''}</span>`;
+  }
+  const why = QUALITY_REASONS[q.reason] || q.reason || 'failed verification';
+  return `<span class="q-badge q-bad" title="${esc(why)}">${esc(label)}`
+       + `<span class="q-reason">${esc(q.reason || 'FAILED')}</span></span>`;
 }
 
 function renderTagChips(tags) {
@@ -1599,6 +1660,41 @@ function _renumber() {
 function exportPlaylist(fmt) {
   if (!currentPlId) { alert('Select a playlist first.'); return; }
   window.open(`/playlists/${currentPlId}/export?format=${fmt}`, '_blank');
+}
+
+// Zips every track in the class, numbered in running order. Zipping happens
+// server-side and can take a moment for a long class, so give some feedback.
+async function downloadClassAudio() {
+  if (!currentPlId) { alert('Select a playlist first.'); return; }
+  const pl = playlists.find(p => p.id === currentPlId);
+  if (!pl || !(pl.tracks || []).length) { alert('This class has no tracks yet.'); return; }
+
+  const btn = document.querySelector('.btn-export-audio');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Zipping…';
+  try {
+    const res = await fetch(`/playlists/${currentPlId}/download`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert(err.error || 'Could not build the zip.');
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = (pl.name || 'class').replace(/[^\w \-]/g, '_') + '.zip';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    alert('Download failed: ' + err);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 }
 
 // ── Dynamic column resize ─────────────────────────────────────────────────────
