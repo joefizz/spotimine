@@ -21,6 +21,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -70,8 +71,29 @@ LOGIN_POLL_S    = 3
 # fail unambiguously either way.
 MIN_BITRATE          = 200_000
 VALID_SAMPLE_RATES   = {44100, 48000}
-MIN_FILE_BYTES       = 1024 * 1024
 DURATION_TOLERANCE_S = 4.0
+
+# Wider for peer-supplied files.  A CD rip routinely carries a second or two of
+# lead-in or run-out that Spotify's duration_ms does not, so ±4 s rejects
+# correct recordings.  This is also the tolerance sockseek is told to search
+# with, so the two cannot drift apart and hand back files we were always going
+# to reject.
+SOULSEEK_DURATION_TOLERANCE_S = 10.0
+
+# LAME V0 averages ~245 kbps and V1 ~225.  Both are transparent — better than
+# the 256 kbps AAC the YouTube Music path targets — yet a flat 256k floor
+# rejects them while waving through a worse 256k CBR file.  VBR is simply how
+# good MP3s are encoded on Soulseek, so the floor has to sit below V1 or the
+# pass throws away its own best results.  V2 (~190 kbps) and below still fail.
+VBR_MIN_BITRATE = 224_000
+
+# A file is only "truncated" relative to how long it should be.  A flat 1 MB
+# floor condemns every interlude, skit and intro — at 256 kbps that is anything
+# under ~32 seconds.  Half of what a minimum-bitrate encode of the expected
+# duration would occupy sits comfortably below any real encoding of it and
+# comfortably above a stub or a captured error page.
+TRUNCATED_FRACTION = 0.5
+MIN_FILE_BYTES     = 64 * 1024
 
 # Codecs that carry no lossy generation loss, so the bitrate floor does not apply
 # to them — a FLAC at 900 kbps and one at 1400 kbps are both bit-exact.
@@ -90,14 +112,21 @@ PROFILES = {
         "codecs":       {"aac"},
         "min_bitrate":  MIN_BITRATE,
         "sample_rates": VALID_SAMPLE_RATES,
+        # itag 141 is always stereo, so anything else is a wrong stream.
+        "channels":     {2},
+        "duration_tolerance": DURATION_TOLERANCE_S,
         "spectral":     False,
     },
     "soulseek": {
         "codecs":       {"flac", "alac", "wav", "pcm_s16le", "pcm_s24le", "mp3", "aac"},
-        # Lossy from a peer must clear 256k, not the 200k itag-141 allowance:
-        # there is no "not strictly CBR" excuse for a file someone else encoded.
-        "min_bitrate":  256_000,
-        "sample_rates": {44100, 48000, 88200, 96000, 176400, 192000},
+        # Low enough to admit V0/V1 VBR — see VBR_MIN_BITRATE.
+        "min_bitrate":  VBR_MIN_BITRATE,
+        "sample_rates": {32000, 44100, 48000, 88200, 96000, 176400, 192000},
+        # None = any channel count.  A genuine mono master (most pre-1968
+        # material) and a 5.1 mix are both legitimate from a peer; rejecting
+        # them as NOT_STEREO discards correct audio for looking unusual.
+        "channels":     None,
+        "duration_tolerance": SOULSEEK_DURATION_TOLERANCE_S,
         "spectral":     True,
     },
 }
@@ -811,6 +840,14 @@ def effective_bitrate(probe: dict) -> int | None:
     return None
 
 
+def _min_plausible_bytes(expected_duration_s: float | None, rules: dict) -> int:
+    """The smallest size a complete file of this length could plausibly be."""
+    if not expected_duration_s or expected_duration_s <= 0:
+        return MIN_FILE_BYTES
+    floor = rules["min_bitrate"] * expected_duration_s / 8 * TRUNCATED_FRACTION
+    return max(MIN_FILE_BYTES, int(floor))
+
+
 def verify_download(
     path: Path,
     expected_duration_s: float | None,
@@ -827,10 +864,16 @@ def verify_download(
     """
     rules = PROFILES.get(profile) or PROFILES[DEFAULT_PROFILE]
     # Size first, so a half-written file reports TRUNCATED rather than the
-    # ffprobe error that truncation causes.
+    # ffprobe error that truncation causes.  The floor is derived from the
+    # expected duration, not fixed, so short tracks are not condemned for being
+    # short — see MIN_FILE_BYTES.
     size = path.stat().st_size if path.exists() else 0
-    if size <= MIN_FILE_BYTES:
-        return "TRUNCATED", {"file_size": size}
+    if size < _min_plausible_bytes(expected_duration_s, rules):
+        return "TRUNCATED", {
+            "file_size": size,
+            "expected_duration": expected_duration_s,
+            "profile": profile,
+        }
 
     try:
         probe = probe_audio(path)
@@ -859,10 +902,14 @@ def verify_download(
     if codec in LOSSLESS_CODECS:
         probe["lossless"] = True
     else:
-        try:
-            bit_rate = int(stream["bit_rate"])
-        except (KeyError, TypeError, ValueError):
-            return "PROBE_FAILED", {**probe, "error": "stream bit_rate missing or unparseable"}
+        # effective_bitrate falls back to size ÷ duration, which is what carries
+        # this through the containers ffprobe reports no stream bit_rate for.
+        # Calling a file unreadable when we can measure it perfectly well would
+        # be a PROBE_FAILED that says more about ffprobe than about the audio.
+        bit_rate = effective_bitrate(probe)
+        if bit_rate is None:
+            return "PROBE_FAILED", {**probe, "error": "bit rate could not be determined"}
+        probe["measured_bitrate"] = bit_rate
         if bit_rate < rules["min_bitrate"]:
             return "LOW_BITRATE", probe
 
@@ -877,7 +924,8 @@ def verify_download(
         channels = int(stream["channels"])
     except (KeyError, TypeError, ValueError):
         return "PROBE_FAILED", {**probe, "error": "stream channels missing or unparseable"}
-    if channels != 2:
+    allowed_channels = rules["channels"]
+    if channels < 1 or (allowed_channels is not None and channels not in allowed_channels):
         return "NOT_STEREO", probe
 
     # The duration check is what catches wrong recordings — a remaster, radio
@@ -893,7 +941,7 @@ def verify_download(
     except (KeyError, TypeError, ValueError):
         return "PROBE_FAILED", {**probe, "error": "format duration missing or unparseable"}
 
-    if abs(actual - expected_duration_s) > DURATION_TOLERANCE_S:
+    if abs(actual - expected_duration_s) > rules["duration_tolerance"]:
         return "DURATION_MISMATCH", probe
 
     # Last, because it is the only expensive check — decode plus STFT.
@@ -943,6 +991,98 @@ def quarantine_file(
         encoding="utf-8",
     )
     return dest
+
+
+# ── the library's quality record ──────────────────────────────────────────────
+# One JSON file beside the songs, keyed by library filename, holding what each
+# file measured as and whether you have accepted it.
+#
+# Two threads write it — the download job as it verifies, and the web request
+# that measures files it has not seen before — so every access goes through one
+# lock and re-reads inside it.  Without that, a page load during a download
+# reads the records, spends seconds in ffprobe, then writes back a snapshot that
+# erases every verdict recorded in the meantime.
+
+QUALITY_FILENAME = "quality.json"
+
+_records_lock = threading.Lock()
+
+
+def _load_records(library_dir: Path) -> dict:
+    path = library_dir / QUALITY_FILENAME
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {}
+
+
+def _save_records(library_dir: Path, records: dict) -> None:
+    path = library_dir / QUALITY_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    os.replace(tmp, path)   # atomic: a crash mid-write cannot leave a stub
+
+
+def read_records(library_dir: Path) -> dict:
+    with _records_lock:
+        return _load_records(library_dir)
+
+
+def update_records(library_dir: Path, entries: dict) -> dict:
+    """Merge entries into the record and return the whole updated set.
+
+    Acceptance is a decision, not a measurement, so re-verifying a file must
+    never silently withdraw it — the flag is carried across every rewrite.
+    """
+    with _records_lock:
+        records = _load_records(library_dir)
+        for name, entry in entries.items():
+            previous = records.get(name) or {}
+            merged = dict(entry)
+            merged.setdefault("accepted", bool(previous.get("accepted")))
+            if previous.get("accepted_at") and merged.get("accepted"):
+                merged.setdefault("accepted_at", previous["accepted_at"])
+            records[name] = merged
+        _save_records(library_dir, records)
+        return records
+
+
+def set_accepted(library_dir: Path, filename: str, accepted: bool) -> dict | None:
+    """Mark a library file as one you want kept, or withdraw that.
+
+    Returns the updated entry, or None if there is no record for that file.
+    """
+    with _records_lock:
+        records = _load_records(library_dir)
+        entry = records.get(filename)
+        if entry is None:
+            return None
+        entry["accepted"] = accepted
+        entry["accepted_at"] = (
+            datetime.now().isoformat(timespec="seconds") if accepted else None
+        )
+        records[filename] = entry
+        _save_records(library_dir, records)
+        return entry
+
+
+def forget_record(library_dir: Path, filename: str) -> bool:
+    """Drop a file's record, so a re-download is measured afresh."""
+    with _records_lock:
+        records = _load_records(library_dir)
+        if records.pop(filename, None) is None:
+            return False
+        _save_records(library_dir, records)
+        return True
+
+
+def accepted_files(library_dir: Path) -> set[str]:
+    """Filenames you have accepted. These are never re-fetched or overwritten."""
+    return {name for name, entry in read_records(library_dir).items()
+            if entry.get("accepted")}
 
 
 # ── standalone gate check ─────────────────────────────────────────────────────

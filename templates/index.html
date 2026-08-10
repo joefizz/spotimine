@@ -125,6 +125,13 @@
   .q-bad { background:rgba(233,69,96,.13); color:var(--accent2); border:1px solid rgba(233,69,96,.4); }
   .q-unknown { background:#1e2a40; color:var(--muted); border:1px solid #2a3a50; }
   .q-reason { font-size:.66rem; opacity:.85; font-weight:600; }
+  .q-accepted { background:rgba(78,205,196,.10); color:var(--teal); border:1px solid rgba(78,205,196,.28); }
+  .q-keep { margin-left:.35rem; padding:.16rem .45rem; border-radius:5px; font-size:.68rem;
+            font-weight:700; letter-spacing:.3px; cursor:pointer; background:transparent;
+            border:1px dashed #2a3a50; color:var(--muted); }
+  .q-keep:hover { border-color:var(--teal); color:var(--teal); background:transparent; }
+  .q-keep.on { border-style:solid; border-color:rgba(78,205,196,.5); color:var(--teal);
+               background:rgba(78,205,196,.12); }
 
   /* ── tags in table ── */
   .tags-cell { display:flex; flex-wrap:wrap; gap:.3rem; align-items:center; min-width:160px; }
@@ -545,7 +552,7 @@ function renderSongs(songs) {
       <td class="cell-muted">${s.tempo ? s.tempo.toFixed(1) : '—'}</td>
       <td class="cell-muted">${s.key || '—'}</td>
       <td class="cell-muted">${s.duration ? fmtTime(s.duration) : '—'}</td>
-      <td class="cell-quality">${renderQuality(s.quality)}</td>
+      <td class="cell-quality">${renderQuality(s.quality)}${renderKeepToggle(s)}</td>
       <td>
         <div class="tags-cell" id="tags-${esc(s.file)}">
           ${renderTagChips(s.tags || [])}
@@ -576,16 +583,40 @@ function renderSongs(songs) {
 
 // Failure reasons in plain language — the code name alone doesn't say what to do.
 const QUALITY_REASONS = {
-  LOW_BITRATE:         'below 256 kbps — only a low-quality source was available',
+  LOW_BITRATE:         'below the floor for this source — only a low-quality copy was available',
   WRONG_CODEC:         'unexpected codec for this source',
   BAD_SAMPLE_RATE:     'unusual sample rate',
-  NOT_STEREO:          'not stereo',
-  TRUNCATED:           'file is truncated or tiny — probably an incomplete download',
+  NOT_STEREO:          'unexpected channel count for this source',
+  TRUNCATED:           'much smaller than this track should be — probably an incomplete download',
   DURATION_MISMATCH:   'length differs from Spotify — may be a different recording, edit or remix',
   PROBE_FAILED:        'could not be read reliably by ffprobe',
   NO_SPOTIFY_DURATION: 'no Spotify duration to compare against',
   TRANSCODE_SUSPECTED: 'looks re-encoded from a lower bitrate',
 };
+
+// Accepting a file is how you overrule a flag: it stops the track being
+// re-downloaded on every run, and stops a later run overwriting your copy.
+// Only offered for files that have a record to attach the decision to.
+function renderKeepToggle(s) {
+  const q = s.quality;
+  if (!q) return '';
+  const on = !!q.accepted;
+  const title = on
+    ? 'Accepted — this file is never re-downloaded or overwritten. Click to undo.'
+    : 'Keep this file as it is: stop re-downloading the track and never overwrite this copy.';
+  return `<button class="q-keep${on ? ' on' : ''}" title="${esc(title)}"`
+       + ` onclick="toggleAccepted('${jsEsc(s.file)}',${on ? 'false' : 'true'})">`
+       + `${on ? '✓ kept' : 'keep'}</button>`;
+}
+
+async function toggleAccepted(filename, accepted) {
+  await fetch(`/songs/${encodeURIComponent(filename)}/accept`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accepted }),
+  });
+  loadAll();
+}
 
 function renderQuality(q) {
   if (!q) return '<span class="cell-muted">—</span>';

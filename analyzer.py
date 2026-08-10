@@ -60,19 +60,10 @@ ARCHIVE_FILENAME   = "spotdl-archive"
 SOULSEEK_STAGING_DIRNAME = "staging-soulseek"
 
 # Every downloaded file is kept, whether or not it meets the quality bar, and its
-# measured properties are recorded here so the library can show what each track
-# actually is. Lives with the songs because it describes them.
-QUALITY_FILENAME = "quality.json"
-
-
-def _read_quality(library_dir: Path) -> dict:
-    path = library_dir / QUALITY_FILENAME
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+# measured properties are recorded in quality.json so the library can show what
+# each track actually is.  The store lives in quality.py because the web layer
+# writes it too and the two must share one lock.
+QUALITY_FILENAME = quality.QUALITY_FILENAME
 
 
 def _record_quality(library_dir: Path, filename: str, reason: str | None,
@@ -96,13 +87,9 @@ def _record_quality(library_dir: Path, filename: str, reason: str | None,
         "spectral_detail": spectral.get("detail"),
         "checked_at":  datetime.now().isoformat(timespec="seconds"),
     }
-
-    records = _read_quality(library_dir)
-    records[filename] = entry
-    (library_dir / QUALITY_FILENAME).write_text(
-        json.dumps(records, indent=2), encoding="utf-8"
-    )
-    return entry
+    # update_records carries the accepted flag across, so re-measuring a file
+    # never withdraws a decision you made about it.
+    return quality.update_records(library_dir, {filename: entry})[filename]
 
 # Filename templates.  Staged files carry the Spotify track id so two tracks with
 # the same artist and title cannot collide; the library name drops it.
@@ -133,10 +120,37 @@ _DOWNLOADED_WRAP_RE = re.compile(r'Downloaded "(?P<name>.+)":\s*$')
 _URL_ONLY_RE        = re.compile(r"^(?P<url>https?://\S+)$")
 
 
-def _audio_files(directory: Path) -> list[Path]:
+# Windows rejects these outright and they are landmines everywhere else.  The
+# spotdl path gets sanitisation for free from create_file_name; anything we name
+# ourselves — every Soulseek result — has to do it here, or os.replace raises an
+# OSError that nothing catches and the whole run dies on one awkward title.
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def _safe_filename(name: str) -> str:
+    """A filename that will not be rejected by the filesystem."""
+    # Trailing dots and spaces are silently stripped by Windows, which would make
+    # the name we record differ from the name on disk.
+    cleaned = _ILLEGAL_NAME_CHARS.sub("_", name).strip().rstrip(" .")
+    return cleaned or "untitled"
+
+
+def _unique_path(path: Path) -> Path:
+    """A path that does not exist yet, by adding a numeric suffix."""
+    candidate, n = path, 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem} {n}{path.suffix}")
+        n += 1
+    return candidate
+
+
+def _audio_files(directory: Path, recursive: bool = False) -> list[Path]:
+    # Recursive for sockseek, which may nest downloads under a peer's directory
+    # structure — a file one level down is still a file we paid to fetch.
     if not directory.exists():
         return []
-    return sorted(p for p in directory.iterdir()
+    walker = directory.rglob("*") if recursive else directory.iterdir()
+    return sorted(p for p in walker
                   if p.is_file() and p.suffix.lower() in AUDIO_EXTS)
 
 
@@ -215,6 +229,9 @@ class _Verifier:
         self.handled: set[Path] = set()
         self.low_bitrate_streak = 0
         self.stopped_early = False
+        # Files you have accepted. Read once, up front: a run must not start
+        # honouring a decision made halfway through it.
+        self.accepted = quality.accepted_files(library_dir)
 
     def handle(
         self,
@@ -239,7 +256,15 @@ class _Verifier:
         dest = final or (self.library_dir / path.name)
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
-            self.log(f"  ! replacing existing library file {dest.name}")
+            if dest.name in self.accepted:
+                # You accepted this copy, so it is not ours to replace. The new
+                # one is parked beside it rather than dropped: you asked to be
+                # the one who decides, and deciding needs both files to exist.
+                dest = _unique_path(dest.with_stem(f"{dest.stem} (alt)"))
+                self.log(f"  keeping your accepted {display} — the new copy is "
+                         f"saved as {dest.name}")
+            else:
+                self.log(f"  ! replacing existing library file {dest.name}")
         os.replace(path, dest)
         self.promoted.append(dest)
 
@@ -359,6 +384,43 @@ def _resolve_paths(song: dict, staging_dir: Path, library_dir: Path) -> tuple[Pa
         return None
 
 
+def _library_stems(song: dict, staging_dir: Path, library_dir: Path) -> set[str]:
+    """Every filename stem this song could already be sitting under.
+
+    Two naming schemes are in play — spotdl's, which joins every artist, and the
+    Soulseek pass's, which uses only the primary one — so a lookup that knows
+    just one of them fails to recognise half the library.
+    """
+    stems = {_safe_filename(_display_name(song))}
+    paths = _resolve_paths(song, staging_dir, library_dir)
+    if paths:
+        stems.add(paths[1].stem)
+    return stems
+
+
+def _norm(text: str) -> str:
+    """Lowercase alphanumerics only — enough to compare names across sources."""
+    return re.sub(r"[^a-z0-9]+", "", (text or "").casefold())
+
+
+def _match_staged(path: Path, songs: list[dict]) -> dict | None:
+    """Find the song a downloaded file belongs to, by loose name comparison.
+
+    sockseek names files from the peer's own metadata, so the exact key match
+    used above is not available here.  A loose match is still far better than
+    the alternative, which is discarding a file we already have on disk.
+    """
+    stem = _norm(path.stem)
+    if not stem:
+        return None
+    for song in songs:
+        title  = _norm(song.get("name", ""))
+        artist = _norm(song.get("artist") or (song.get("artists") or [""])[0])
+        if title and title in stem and (not artist or artist in stem):
+            return song
+    return None
+
+
 def _soulseek_pass(
     songs: list[dict],
     download_dir: Path,
@@ -381,10 +443,33 @@ def _soulseek_pass(
 
     staging = download_dir / SOULSEEK_STAGING_DIRNAME
     results = soulseek.download(songs, staging, log)
-    if not results:
-        return []
 
     promoted: list[tuple[Path, dict]] = []
+    claimed: set[str] = set()
+
+    def take(staged: Path, song: dict | None, display: str, source: str | None):
+        """Verify one downloaded file and move it into the library."""
+        # track_streak=False: a run of bad rips from peers says nothing about the
+        # YouTube Music session, so it must not trigger the cookie-expiry abort.
+        #
+        # Only a *passing* file counts as satisfying the track. A flagged one is
+        # kept in the library but stays unsatisfied, so it is not archived and a
+        # later run can still replace it with something better.
+        passed = verifier.handle(
+            staged,
+            display,
+            float(song["duration"]) if song else None,
+            source,
+            # Sanitised: this name comes from Spotify metadata, not from
+            # spotdl's resolver, so nothing else has made it legal on disk.
+            download_dir / f"{_safe_filename(display)}{staged.suffix}",
+            profile="soulseek",
+            track_streak=False,
+        )
+        if passed and song:
+            promoted.append((verifier.promoted[-1], song))
+            claimed.add(song["song_id"])
+
     for song in songs:
         artist  = song.get("artist") or (song.get("artists") or [""])[0]
         display = _display_name(song)
@@ -399,22 +484,20 @@ def _soulseek_pass(
             log(f"  ! {display}: sockseek reported {staged} but it is not there")
             continue
 
-        # track_streak=False: a run of bad rips from peers says nothing about the
-        # YouTube Music session, so it must not trigger the cookie-expiry abort.
-        #
-        # Only a *passing* file counts as satisfying the track. A flagged one is
-        # kept in the library but stays unsatisfied, so it is not archived and a
-        # later run can still replace it with something better.
-        if verifier.handle(
-            staged,
-            display,
-            float(song["duration"]),
-            result.get("provenance"),
-            download_dir / f"{display}{staged.suffix}",
-            profile="soulseek",
-            track_streak=False,
-        ):
-            promoted.append((verifier.promoted[-1], song))
+        take(staged, song, display, result.get("provenance"))
+
+    # Safety net, exactly as the spotdl staging directory gets. The lookup above
+    # keys on whatever sockseek echoed back, so a single normalisation
+    # difference is enough to strand a file that is sitting right there on disk
+    # — and a stranded file is reported as "never found" while quietly filling a
+    # staging directory nobody ever looks in.
+    for path in _audio_files(staging, recursive=True):
+        if path in verifier.handled:
+            continue
+        song = _match_staged(path, [s for s in songs if s["song_id"] not in claimed])
+        display = _display_name(song) if song else path.stem
+        log(f"  ! unclaimed file in {SOULSEEK_STAGING_DIRNAME}/: {path.name}")
+        take(path, song, display, f"soulseek:unmatched:{path.name}")
 
     return promoted
 
@@ -447,6 +530,25 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             for line in archive.read_text(encoding="utf-8").splitlines()
             if line.strip()
         }
+
+    # Files you have accepted are yours. Archiving them before spotdl starts is
+    # what actually stops the re-fetch — spotdl reads the archive at launch — and
+    # it is the only thing that ends the retry loop for a track that is flagged
+    # but perfectly listenable. Without it a flagged file is re-downloaded and
+    # overwritten on every single run.
+    accepted_names = quality.accepted_files(download_dir)
+    accepted_ids: set[str] = set()
+    if accepted_names:
+        accepted_stems = {Path(name).stem for name in accepted_names}
+        for song in songs:
+            if _library_stems(song, staging_dir, download_dir) & accepted_stems:
+                accepted_ids.add(song["song_id"])
+                if song.get("url"):
+                    verified_urls.add(song["url"])
+        if accepted_ids:
+            log(f"Keeping {len(accepted_ids)} accepted track(s) as they are.")
+            archive.write_text("\n".join(sorted(verified_urls)) + "\n",
+                               encoding="utf-8")
 
     log(f"Starting download → {staging_dir}")
     process = subprocess.Popen(
@@ -520,6 +622,11 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     for song in songs:
         if verifier.stopped_early:
             break
+        # Already yours, and already archived above — nothing to verify, and
+        # nothing here is allowed to touch the file.
+        if song["song_id"] in accepted_ids:
+            satisfied_ids.add(song["song_id"])
+            continue
         display = _display_name(song)
         source  = source_urls.get(display)
         paths   = _resolve_paths(song, staging_dir, download_dir)
@@ -560,7 +667,7 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             display,
             float(song["duration"]) if song else None,
             source_urls.get(display) or source_urls.get(path.stem),
-            download_dir / f"{display}{path.suffix}",
+            download_dir / f"{_safe_filename(display)}{path.suffix}",
         ) and song:
             satisfied_ids.add(song["song_id"])
             if song.get("url"):
@@ -602,10 +709,14 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     log(f"    from YouTube Music:    {from_ytmusic}")
     if from_soulseek:
         log(f"    from Soulseek:         {from_soulseek}")
+    if accepted_ids:
+        log(f"    already accepted:      {len(accepted_ids)} (left untouched)")
     if verifier.flagged:
         log(f"  Kept but flagged: {len(verifier.flagged)}")
         for name, reason in verifier.flagged:
             log(f"    • {name}  [{reason}]")
+        log("  Nothing here was deleted. Accept any of them in the library to "
+            "stop it being re-downloaded and replaced.")
     if never_found:
         log(f"  Never found: {len(never_found)}")
         for name in never_found:

@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -49,12 +50,14 @@ LISTEN_PORT = os.environ.get("SPOTIMINE_SLSK_PORT", "49998")
 # advisory: ffprobe remains the authority. Deliberately NOT --strict-conditions,
 # which would reject every file with unknown properties and cut out all
 # stock-client peers — exactly the peers holding the obscure tracks.
-FORMATS          = "mp3,flac"
-MIN_BITRATE_KBPS = "256"
+FORMATS = "mp3,flac"
 
-# Spotify durations differ from CD rips by more than sockseek's default 3 s often
-# enough to lose good matches. Our own ±4 s ffprobe check is the real gate.
-LENGTH_TOL_S = "10"
+# Both derived from the verification profile rather than written out again.
+# Telling sockseek a stricter bar than we will accept costs candidates we would
+# have kept; telling it a looser one buys downloads we were always going to
+# reject. Either way the two drifting apart is a bug, so they share one source.
+MIN_BITRATE_KBPS = str(quality.PROFILES["soulseek"]["min_bitrate"] // 1000)
+LENGTH_TOL_S     = str(int(quality.PROFILES["soulseek"]["duration_tolerance"]))
 
 # sockseek's rate limit is roughly 34 searches per 220 s; exceeding it earns a
 # 30-minute server ban. A second pass over a few tracks is well inside that, but
@@ -233,6 +236,14 @@ def _key(artist: str, title: str) -> tuple[str, str]:
     return (artist or "").strip().casefold(), (title or "").strip().casefold()
 
 
+# sockseek emits a track_state event on every state transition, not only the
+# last one, so "this event is not a success" is a very different statement from
+# "this track failed". Recording the former as the latter is how a track that
+# downloaded fine ends up reported as missing while its file sits in staging.
+TERMINAL_OUTCOMES = {"Succeeded", "PartialSuccess", "Failed", "Cancelled", "Skipped"}
+SUCCESS_OUTCOMES  = {"Succeeded", "PartialSuccess"}
+
+
 def download(
     songs: list[dict],
     staging_dir: Path,
@@ -269,6 +280,21 @@ def download(
         log(f"  Soulseek pass skipped: could not run {BINARY}: {exc}")
         return {}
 
+    # The read loop below blocks on peers, so the timeout has to be enforced from
+    # outside it: killing the process closes stdout, which ends the loop. Waiting
+    # on the process afterwards cannot do this — by the time stdout has closed
+    # the process is already exiting, so the wait returns instantly and the
+    # timeout bounds nothing at all.
+    timed_out = threading.Event()
+
+    def _give_up():
+        timed_out.set()
+        process.kill()
+
+    watchdog = threading.Timer(TIMEOUT_S, _give_up)
+    watchdog.daemon = True
+    watchdog.start()
+
     try:
         for event in _iter_events(process.stdout):
             data = event.get("data") or {}
@@ -285,7 +311,7 @@ def download(
             key = _key(data.get("artist", ""), data.get("title", ""))
             path = data.get("downloadPath")
 
-            if outcome in ("Succeeded", "PartialSuccess") and path:
+            if outcome in SUCCESS_OUTCOMES and path:
                 user = data.get("username") or "unknown"
                 results[key] = {
                     "path": Path(path),
@@ -297,24 +323,45 @@ def download(
                 }
                 log(f"    got: {data.get('artist')} - {data.get('title')} "
                     f"from {user}")
-            else:
-                results[key] = {
-                    "path": None, "provenance": None,
-                    "advertised_bitrate": None,
-                    "outcome": outcome, "failure": failure,
-                }
-                # These mean different things and deserve different reactions.
-                if failure == "NoSearchResults":
-                    log(f"    absent from Soulseek: {data.get('artist')} - "
-                        f"{data.get('title')}")
-                elif failure == "NoMatchingResults":
-                    log(f"    on Soulseek but nothing met the quality bar: "
-                        f"{data.get('artist')} - {data.get('title')}")
-        process.wait(timeout=TIMEOUT_S)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        log(f"  Soulseek pass timed out after {TIMEOUT_S}s; keeping what arrived.")
+                continue
+
+            # A track still in flight is not a verdict, and a late event for a
+            # track that already delivered must never erase the file we hold.
+            if outcome not in TERMINAL_OUTCOMES:
+                continue
+            if (results.get(key) or {}).get("path"):
+                continue
+
+            results[key] = {
+                "path": None, "provenance": None,
+                "advertised_bitrate": None,
+                "outcome": outcome, "failure": failure,
+            }
+            # These mean different things and deserve different reactions.
+            if failure == "NoSearchResults":
+                log(f"    absent from Soulseek: {data.get('artist')} - "
+                    f"{data.get('title')}")
+            elif failure == "NoMatchingResults":
+                log(f"    on Soulseek but nothing met the quality bar: "
+                    f"{data.get('artist')} - {data.get('title')}")
     except Exception as exc:
         log(f"  Soulseek pass failed: {exc}")
+    finally:
+        watchdog.cancel()
+        # Always reap. A surviving sockseek holds the listen port and carries on
+        # writing into a staging directory nobody is reading any more.
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+
+    if timed_out.is_set():
+        log(f"  Soulseek pass timed out after {TIMEOUT_S}s; keeping what arrived.")
 
     return results

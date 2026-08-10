@@ -51,13 +51,7 @@ def _safe_name(name: str) -> str:
 
 def _read_quality() -> dict:
     """Measured properties per library file, written by the download pass."""
-    path = SONGS_DIR / "quality.json"
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
+    return quality.read_records(SONGS_DIR)
 
 
 def _measure_unrecorded(records: dict) -> dict:
@@ -69,7 +63,10 @@ def _measure_unrecorded(records: dict) -> dict:
     would be worse than admitting they were never checked.
 
     Results are cached in quality.json, so this costs one ffprobe per new file
-    rather than one per page load.
+    rather than one per page load.  The write goes through quality.update_records
+    because a download job may be recording verdicts at the same time: ffprobe
+    here takes seconds, and a plain read-modify-write would erase everything
+    recorded during them.
     """
     fresh = {}
     for f in SONGS_DIR.iterdir():
@@ -95,9 +92,7 @@ def _measure_unrecorded(records: dict) -> dict:
                              "codec": None, "bitrate": None}
 
     if fresh:
-        records = {**records, **fresh}
-        (SONGS_DIR / "quality.json").write_text(
-            json.dumps(records, indent=2), encoding="utf-8")
+        return quality.update_records(SONGS_DIR, fresh)
     return records
 
 
@@ -269,11 +264,32 @@ def delete_song(filename: str):
             p.unlink()
     # Drop its quality record too, so a re-download is measured afresh rather
     # than inheriting the old verdict.
-    records = _read_quality()
-    if records.pop(filename, None) is not None:
-        (SONGS_DIR / "quality.json").write_text(
-            json.dumps(records, indent=2), encoding="utf-8")
+    quality.forget_record(SONGS_DIR, filename)
     return jsonify({"ok": True})
+
+
+@app.route("/songs/<path:filename>/accept", methods=["PUT"])
+def accept_song(filename: str):
+    """Mark a file as one to keep, or withdraw that.
+
+    Accepting is how you overrule a flag.  It does two things: the track is
+    archived, so no later run re-downloads it, and the file is protected, so no
+    later run overwrites it.  A flagged file you never accept keeps being
+    retried — which is the right default, because most flags are worth acting on.
+    """
+    data = request.get_json(silent=True) or {}
+    accepted = bool(data.get("accepted", True))
+
+    # Only the bare filename: a library decision must not be able to name a path
+    # outside the songs directory.
+    name = Path(filename).name
+    if not (SONGS_DIR / name).is_file():
+        return jsonify({"ok": False, "error": "no such file"}), 404
+
+    entry = quality.set_accepted(SONGS_DIR, name, accepted)
+    if entry is None:
+        return jsonify({"ok": False, "error": "no quality record for this file"}), 404
+    return jsonify({"ok": True, "quality": entry})
 
 
 @app.route("/songs", methods=["DELETE"])
