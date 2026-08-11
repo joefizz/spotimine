@@ -55,6 +55,26 @@
   .cookie-state.bad     { color:var(--accent); }
   .cookie-state.unknown { color:var(--muted); }
   .cookie-head .btn-ghost { margin-left:auto; }
+
+  /* ── source enable/disable ── */
+  .src-toggle { display:inline-flex; align-items:center; gap:.45rem; cursor:pointer;
+                user-select:none; font-size:.74rem; font-weight:700; color:var(--muted);
+                text-transform:uppercase; letter-spacing:.6px; }
+  .src-toggle input { display:none; }
+  .src-track { width:34px; height:18px; border-radius:20px; background:#2a3a50;
+               border:1px solid var(--surf2); position:relative; transition:background .15s; }
+  .src-track::after { content:''; position:absolute; top:2px; left:2px; width:12px; height:12px;
+                      border-radius:50%; background:var(--muted); transition:transform .15s,background .15s; }
+  .src-toggle input:checked + .src-track { background:rgba(78,205,196,.28); border-color:rgba(78,205,196,.5); }
+  .src-toggle input:checked + .src-track::after { transform:translateX(16px); background:var(--teal); }
+  .src-toggle.locked { opacity:.55; cursor:not-allowed; }
+  /* A disabled source stays readable but stops competing for attention. */
+  .card-wrap.src-off { opacity:.55; }
+  .card-wrap.src-off .cookie-head { opacity:1; }
+  .src-warn { background:rgba(233,69,96,.12); border:1px solid rgba(233,69,96,.4);
+              color:var(--accent); border-radius:var(--r); padding:.7rem 1rem;
+              margin-bottom:2rem; font-size:.84rem; font-weight:600; display:none; }
+  .src-warn.show { display:block; }
   .cookie-body { display:none; margin-top:1.1rem; }
   .cookie-body.open { display:block; }
   .cookie-hint { font-size:.82rem; color:var(--muted); line-height:1.6; margin-bottom:.8rem; }
@@ -97,6 +117,13 @@
 
   /* ── songs table ── */
   section { margin-bottom:2.5rem; }
+  /* Every cell in this table is nowrap, so the table's minimum width is the sum
+     of its columns and it will happily render wider than the column it sits in —
+     sliding under the class builder rather than shrinking. min-width:0 on the
+     flex parent lets the *panel* shrink but does nothing for the table inside
+     it, so the table needs its own scroll container. This also holds when the
+     divider is dragged left or a narrow split is restored from localStorage. */
+  .table-scroll { max-width:100%; overflow-x:auto; }
   .songs-table { width:100%; border-collapse:collapse; }
   .songs-table th { text-align:left; font-size:.74rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; padding:.6rem .9rem; border-bottom:1px solid var(--surf2); white-space:nowrap; cursor:pointer; user-select:none; transition:color .15s; }
   .songs-table th:hover { color:var(--accent); }
@@ -274,9 +301,18 @@
   </div>
 
   <!-- YouTube Music session -->
-  <div class="card-wrap">
+  <div class="src-warn" id="src-warn">
+    Both download sources are disabled, so a run has nowhere to fetch from.
+    Enable at least one below.
+  </div>
+
+  <div class="card-wrap" id="card-ytmusic">
     <div class="cookie-head">
       <h2>YouTube Music session</h2>
+      <label class="src-toggle" id="toggle-ytmusic-label">
+        <input type="checkbox" id="toggle-ytmusic" onchange="setSource('ytmusic',this.checked)">
+        <span class="src-track"></span><span id="toggle-ytmusic-text">on</span>
+      </label>
       <span class="cookie-state unknown" id="cookie-state">
         <span class="dot" id="cookie-dot"></span><span id="cookie-state-text">checking…</span>
       </span>
@@ -301,9 +337,13 @@
   </div>
 
   <!-- Soulseek (second source) -->
-  <div class="card-wrap">
+  <div class="card-wrap" id="card-soulseek">
     <div class="cookie-head">
       <h2>Soulseek <span style="text-transform:none;letter-spacing:0">— second source</span></h2>
+      <label class="src-toggle" id="toggle-soulseek-label">
+        <input type="checkbox" id="toggle-soulseek" onchange="setSource('soulseek',this.checked)">
+        <span class="src-track"></span><span id="toggle-soulseek-text">on</span>
+      </label>
       <span class="cookie-state unknown" id="slsk-state">
         <span class="dot" id="slsk-dot"></span><span id="slsk-state-text">checking…</span>
       </span>
@@ -341,6 +381,7 @@
           <span class="badge" id="songs-count">0</span>
           <button class="btn-danger" onclick="confirmPurge()">Purge All</button>
         </div>
+        <div class="table-scroll">
         <table class="songs-table">
           <thead>
             <tr>
@@ -358,6 +399,7 @@
             <tr class="empty-row"><td colspan="8">No songs downloaded yet.</td></tr>
           </tbody>
         </table>
+        </div>
       </section>
 
       <!-- Analysis Reports -->
@@ -488,6 +530,7 @@ const audio   = document.getElementById('audio');
 // ── Boot ──────────────────────────────────────────────────────────────────────
 window.addEventListener('load', () => {
   loadAll();
+  refreshSourceStatus();
   refreshCookieStatus();
   refreshSlskStatus();
 });
@@ -896,6 +939,55 @@ function startAnalysis() {
     es.onerror = () => { setStatus('error', 'Connection lost'); btn.disabled = false; es.close(); };
   })
   .catch(err => { setStatus('error', String(err)); btn.disabled = false; });
+}
+
+// ── Download sources ──────────────────────────────────────────────────────────
+// A disabled source is skipped entirely: no Premium gate for YouTube Music, no
+// search for Soulseek. Turning both off is allowed and saved — the warning says
+// what it means rather than the toggle refusing the click.
+
+function applySourceStatus(s) {
+  for (const src of s.sources) {
+    const box   = document.getElementById(`toggle-${src.name}`);
+    const label = document.getElementById(`toggle-${src.name}-label`);
+    const text  = document.getElementById(`toggle-${src.name}-text`);
+    const card  = document.getElementById(`card-${src.name}`);
+    if (!box) continue;
+    box.checked = src.enabled;
+    text.textContent = src.enabled ? 'on' : 'off';
+    card.classList.toggle('src-off', !src.enabled);
+    // An environment variable wins over anything saved here, so the toggle
+    // would silently snap back. Say so instead of letting it look broken.
+    box.disabled = src.env_override;
+    label.classList.toggle('locked', src.env_override);
+    label.title = src.env_override
+      ? `Pinned by ${src.env_var} in the environment — the app cannot change it.`
+      : (src.enabled ? `${src.label} is used for downloads. Click to disable.`
+                     : `${src.label} is skipped entirely. Click to enable.`);
+  }
+  document.getElementById('src-warn').classList.toggle('show', !s.any_enabled);
+}
+
+async function refreshSourceStatus() {
+  try {
+    applySourceStatus(await fetch('/sources').then(r => r.json()));
+  } catch { /* leave the toggles as they are rather than lying about them */ }
+}
+
+async function setSource(name, enabled) {
+  try {
+    const res = await fetch('/sources', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ [name]: enabled }),
+    });
+    const s = await res.json();
+    if (!res.ok) { alert(s.error || 'Could not change the source.'); }
+    applySourceStatus(s.sources ? s : await fetch('/sources').then(r => r.json()));
+  } catch {
+    alert('Could not reach the server to change the source.');
+    refreshSourceStatus();
+  }
 }
 
 // ── YouTube Music session cookies ─────────────────────────────────────────────

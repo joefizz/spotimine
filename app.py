@@ -15,6 +15,7 @@ from flask import (Flask, Response, after_this_request, jsonify, render_template
                    request, send_file, send_from_directory)
 
 import quality
+import settings
 
 SONGS_DIR   = Path("songs")
 REPORTS_DIR = Path("static") / "reports"
@@ -307,6 +308,38 @@ def purge_all():
 @app.route("/static/reports/<path:filename>")
 def serve_report(filename: str):
     return send_from_directory(REPORTS_DIR, filename)
+
+
+# ── download sources ──────────────────────────────────────────────────────────
+
+@app.route("/sources")
+def get_sources():
+    """Which download sources are enabled, and whether the environment pins them."""
+    return jsonify(settings.status())
+
+
+@app.route("/sources", methods=["PUT"])
+def set_sources():
+    """Enable or disable download sources.
+
+    Takes a partial map of {source: bool}, so a single toggle sends only its own
+    source and cannot disturb the other one.
+    """
+    data = request.get_json(silent=True) or {}
+    wanted = {k: v for k, v in data.items() if k in settings.SOURCES}
+    if not wanted:
+        return jsonify({
+            "ok": False,
+            "error": f"name at least one of: {', '.join(settings.SOURCES)}",
+        }), 400
+
+    try:
+        for source, enabled in wanted.items():
+            settings.set_enabled(source, bool(enabled))
+    except OSError as exc:
+        return jsonify({"ok": False, "error": f"Could not save: {exc}"}), 500
+
+    return jsonify({"ok": True, **settings.status()})
 
 
 # ── youtube music session cookies ─────────────────────────────────────────────

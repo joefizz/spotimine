@@ -29,6 +29,7 @@ import matplotlib.patches as mpatches
 from matplotlib.gridspec import GridSpec
 
 import quality
+import settings
 import soulseek
 
 # ── colour palette ────────────────────────────────────────────────────────────
@@ -398,6 +399,75 @@ def _library_stems(song: dict, staging_dir: Path, library_dir: Path) -> set[str]
     return stems
 
 
+def _ytmusic_pass(
+    url: str,
+    staging_dir: Path,
+    archive: Path,
+    source_urls: dict[str, str],
+    log: LogFn,
+) -> None:
+    """Run spotdl against YouTube Music, staging what it fetches.
+
+    Fills ``source_urls`` with {display name: source URL} as spotdl reports
+    them.  Verification happens afterwards, in the shared verifier — nothing
+    here decides whether a file is good enough.
+    """
+    log(f"Starting download → {staging_dir}")
+    process = subprocess.Popen(
+        [
+            "spotdl", url,
+            # These three together are what produce 256 kbps AAC; dropping any
+            # one of them silently yields 128 kbps.  (--only-verified-results is
+            # deliberately absent: it only pre-filters candidates to YouTube
+            # Music catalog entries, discarding the whole "videos" search pass
+            # before scoring, which loses remixes and edits.  It has no effect on
+            # bitrate or stream format.)
+            "--audio", "youtube-music",
+            "--format", "m4a",
+            "--bitrate", "disable",
+            # Pin sanitisation so _resolve_paths agrees with spotdl regardless of
+            # the user's global spotdl config.
+            "--restrict", RESTRICT_MODE,
+            # Without the cookie file spotdl's yt-dlp is unauthenticated and
+            # gets 128 kbps regardless of the premium gate passing.
+            "--cookie-file", str(quality.COOKIE_FILE),
+            "--archive", str(archive),
+            "--output", str(staging_dir / STAGING_TEMPLATE),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        # Stop spotdl's console wrapping long lines, which splits the
+        # `Downloaded "name": url` pairs the source URLs are read from.
+        env={**os.environ, "COLUMNS": "1000"},
+    )
+    pending_name: str | None = None
+    for line in process.stdout:
+        line = line.rstrip()
+        if not line:
+            continue
+        log(line)
+
+        matched = _DOWNLOADED_RE.search(line)
+        if matched:
+            source_urls[matched.group("name")] = matched.group("url")
+            pending_name = None
+            continue
+
+        wrapped = _DOWNLOADED_WRAP_RE.search(line)
+        if wrapped:
+            pending_name = wrapped.group("name")
+            continue
+
+        if pending_name:
+            url_only = _URL_ONLY_RE.match(line.strip())
+            if url_only:
+                source_urls[pending_name] = url_only.group("url")
+            pending_name = None
+    process.wait()
+
+
 def _norm(text: str) -> str:
     """Lowercase alphanumerics only — enough to compare names across sources."""
     return re.sub(r"[^a-z0-9]+", "", (text or "").casefold())
@@ -433,6 +503,10 @@ def _soulseek_pass(
     same verifier, under the "soulseek" profile — a peer's file has to clear the
     bar just as a YouTube Music one does.
     """
+    if not settings.is_enabled("soulseek"):
+        log("\nSoulseek pass skipped: disabled.")
+        return []
+
     ok, reason = soulseek.is_configured()
     if not ok:
         log(f"\nSoulseek pass skipped: {reason}")
@@ -509,11 +583,22 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     quality.verify_download are promoted into download_dir.  Failures are moved
     to download_dir/quarantine with a .json sidecar and never returned.
     """
+    enabled = settings.enabled_sources()
+    if not enabled:
+        raise quality.QualityGateError(
+            "Every download source is disabled, so there is nothing to download "
+            "from.\nEnable YouTube Music or Soulseek in the app, or set "
+            f"{settings.ENV_VARS['ytmusic']}=1 / "
+            f"{settings.ENV_VARS['soulseek']}=1."
+        )
+
     _ensure_ffmpeg(log)
     download_dir.mkdir(parents=True, exist_ok=True)
     staging_dir    = download_dir / STAGING_DIRNAME
     quarantine_dir = download_dir / QUARANTINE_DIRNAME
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"Download sources enabled: {settings.describe_enabled()}")
 
     log("Reading Spotify track metadata ...")
     songs = _fetch_track_metadata(url, staging_dir)
@@ -550,61 +635,11 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             archive.write_text("\n".join(sorted(verified_urls)) + "\n",
                                encoding="utf-8")
 
-    log(f"Starting download → {staging_dir}")
-    process = subprocess.Popen(
-        [
-            "spotdl", url,
-            # These three together are what produce 256 kbps AAC; dropping any
-            # one of them silently yields 128 kbps.  (--only-verified-results is
-            # deliberately absent: it only pre-filters candidates to YouTube
-            # Music catalog entries, discarding the whole "videos" search pass
-            # before scoring, which loses remixes and edits.  It has no effect on
-            # bitrate or stream format.)
-            "--audio", "youtube-music",
-            "--format", "m4a",
-            "--bitrate", "disable",
-            # Pin sanitisation so _resolve_paths agrees with spotdl regardless of
-            # the user's global spotdl config.
-            "--restrict", RESTRICT_MODE,
-            # Without the cookie file spotdl's yt-dlp is unauthenticated and
-            # gets 128 kbps regardless of the premium gate passing.
-            "--cookie-file", str(quality.COOKIE_FILE),
-            "--archive", str(archive),
-            "--output", str(staging_dir / STAGING_TEMPLATE),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        # Stop spotdl's console wrapping long lines, which splits the
-        # `Downloaded "name": url` pairs the source URLs are read from.
-        env={**os.environ, "COLUMNS": "1000"},
-    )
     source_urls: dict[str, str] = {}
-    pending_name: str | None = None
-    for line in process.stdout:
-        line = line.rstrip()
-        if not line:
-            continue
-        log(line)
-
-        matched = _DOWNLOADED_RE.search(line)
-        if matched:
-            source_urls[matched.group("name")] = matched.group("url")
-            pending_name = None
-            continue
-
-        wrapped = _DOWNLOADED_WRAP_RE.search(line)
-        if wrapped:
-            pending_name = wrapped.group("name")
-            continue
-
-        if pending_name:
-            url_only = _URL_ONLY_RE.match(line.strip())
-            if url_only:
-                source_urls[pending_name] = url_only.group("url")
-            pending_name = None
-    process.wait()
+    if settings.is_enabled("ytmusic"):
+        _ytmusic_pass(url, staging_dir, archive, source_urls, log)
+    else:
+        log("YouTube Music is disabled — skipping its pass.")
 
     verifier = _Verifier(download_dir, quarantine_dir, log)
     not_downloaded: list[str] = []
@@ -614,6 +649,10 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     if adopted:
         log(f"Adopted {adopted} file(s) quarantined by an earlier run.")
 
+    # The staging sweep runs whether or not YouTube Music was used this time: an
+    # earlier run may have been interrupted with files still in there, and a
+    # downloaded file must never be left to rot because a source was later
+    # switched off.
     log(f"\nVerifying {len(_audio_files(staging_dir))} downloaded file(s) ...")
 
     # Walk the playlist rather than the directory: spotdl tells us exactly where
@@ -706,9 +745,16 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     log("\n── Download summary ─────────────────────────────")
     log(f"  {len(songs)} track(s): {len(verifier.promoted)} in library, "
         f"{len(never_found)} not downloaded")
-    log(f"    from YouTube Music:    {from_ytmusic}")
-    if from_soulseek:
+    # Only report a source that was actually allowed to run: a flat "from
+    # Soulseek: 0" against a source you switched off reads like a failure.
+    if settings.is_enabled("ytmusic"):
+        log(f"    from YouTube Music:    {from_ytmusic}")
+    if settings.is_enabled("soulseek") or from_soulseek:
         log(f"    from Soulseek:         {from_soulseek}")
+    disabled = [settings.LABELS[s] for s in settings.SOURCES
+                if not settings.is_enabled(s)]
+    if disabled:
+        log(f"    disabled:              {', '.join(disabled)}")
     if accepted_ids:
         log(f"    already accepted:      {len(accepted_ids)} (left untouched)")
     if verifier.flagged:
@@ -984,8 +1030,13 @@ def compute_chart_bounds() -> dict:
 def run_analysis(url: str, songs_dir: Path, reports_dir: Path, log: LogFn = print):
     """Full pipeline: download playlist, analyze each track, write PNG charts."""
     # Raises QualityGateError before anything is fetched if 256 kbps AAC cannot
-    # be confirmed.  There is no bypass.
-    quality.ensure_premium_access(log)
+    # be confirmed.  There is no bypass — but there is no point either when
+    # YouTube Music is switched off: the gate would abort a Soulseek-only run
+    # over a cookie that run was never going to use.
+    if settings.is_enabled("ytmusic"):
+        quality.ensure_premium_access(log)
+    else:
+        log("YouTube Music is disabled — skipping the Premium gate.")
 
     audio_files = download_playlist(url, songs_dir, log)
 
