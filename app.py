@@ -9,6 +9,7 @@ import os
 import queue
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from flask import (Flask, Response, after_this_request, jsonify, render_template,
@@ -332,14 +333,21 @@ def import_songs():
 
     job_id = None
     if imported:
-        # Measure them, then accept them, in that order: set_accepted needs a
-        # record to attach the decision to.
-        _measure_unrecorded(_read_quality())
-        for name in imported:
-            quality.set_accepted(SONGS_DIR, name, True)
+        # Accept them the moment they land: you chose these files, so nothing
+        # may overwrite them, and that must not wait on the analysis. The real
+        # verdict is filled in by the job below, which preserves this flag.
+        now = datetime.now().isoformat(timespec="seconds")
+        quality.update_records(SONGS_DIR, {
+            name: {
+                "ok": None, "verified": False, "reason": None,
+                "codec": None, "bitrate": None, "source": "import:local",
+                "accepted": True, "accepted_at": now,
+            }
+            for name in imported
+        })
 
-        # Charting decodes the whole file, so it runs in the background on the
-        # same job plumbing the playlist run uses.
+        # Both halves of the analysis decode the whole file, so they run in the
+        # background on the same job plumbing the playlist run uses.
         job_id = uuid.uuid4().hex[:8]
         q: queue.Queue = queue.Queue()
         with _jobs_lock:
@@ -858,8 +866,53 @@ def _build_markdown(summary: dict, tracks: list) -> str:
 
 # ── job runner ────────────────────────────────────────────────────────────────
 
+def _verify_imported(paths: list, log) -> None:
+    """Give imported files a real quality verdict, not a shrug.
+
+    Everything measurable is judged exactly as it is for a download — codec,
+    bit rate, sample rate, channels, and the spectral pass that spots audio
+    re-encoded up from a lower bitrate. Only the duration comparison is absent,
+    because a file from your own machine has no Spotify track to compare with.
+
+    Nothing is ever moved or deleted on the strength of this: the file is
+    already accepted, so a flag is information for you, not a sentence.
+    """
+    from analyzer import _record_quality
+
+    log(f"\nChecking {len(paths)} imported file(s) ...")
+    for path in paths:
+        try:
+            reason, probe = quality.verify_download(path, None, profile="local")
+        except Exception as exc:
+            log(f"  ! {path.name}: could not be checked ({exc})")
+            continue
+
+        # verify_download stops at the first failure, and the spectral pass is
+        # last because it is the expensive one. For a download that is right:
+        # no point decoding a file you are about to reject. For an import it is
+        # exactly wrong — the file is being kept either way, so a flagged one
+        # would end up with *less* analysis than a clean one. Run it regardless.
+        if "spectral" not in probe:
+            probe["spectral"] = quality.analyse_spectrum(path)
+
+        entry = _record_quality(SONGS_DIR, path.name, reason, probe, "import:local")
+        rate  = f"{entry['bitrate'] // 1000}k" if entry.get("bitrate") else "?"
+        codec = entry.get("codec") or "?"
+
+        if reason is None:
+            log(f"  ✓ {path.name}  [{codec} {rate}]")
+        else:
+            log(f"  ⚠ {path.name}  [{codec} {rate}] flagged {reason}")
+
+        # The spectral verdict is the one thing metadata cannot show, so say it
+        # out loud rather than leaving it in a tooltip.
+        if (probe.get("spectral") or {}).get("verdict") == "suspect":
+            log(f"    ⚠ looks re-encoded from a lower bitrate: "
+                f"{probe['spectral'].get('detail', '')}")
+
+
 def _run_import_job(job_id: str, paths: list, q: queue.Queue):
-    """Chart files that were just imported. No downloading is involved."""
+    """Verify and chart files that were just imported. No downloading involved."""
     from analyzer import analyze_files
 
     def log(msg: str):
@@ -867,7 +920,8 @@ def _run_import_job(job_id: str, paths: list, q: queue.Queue):
 
     try:
         log(f"Imported {len(paths)} file(s) into the library.")
-        log("These are kept as they are — accepted, so no run will replace them.")
+        log("Kept as accepted, so no download run will replace them.")
+        _verify_imported(paths, log)
         analyze_files(paths, REPORTS_DIR, log)
         q.put({"type": "done", "charts": _load_charts()})
     except Exception as exc:

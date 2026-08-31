@@ -130,6 +130,25 @@ PROFILES = {
         "duration_tolerance": SOULSEEK_DURATION_TOLERANCE_S,
         "spectral":     True,
     },
+    # Files you imported from your own machine. Everything measurable is judged
+    # exactly as it would be from any other source — including the spectral pass
+    # that spots audio re-encoded up from a lower bitrate. The one check that is
+    # skipped is the duration comparison, because there is no Spotify track to
+    # compare against; duration_tolerance of None says that explicitly, so a
+    # missing reference reads as "not applicable" rather than as a fault in a
+    # file that may be perfectly good.
+    "local": {
+        "codecs":       {"flac", "alac", "wav", "pcm_s16le", "pcm_s24le", "pcm_s32le",
+                         "mp3", "aac", "opus", "vorbis"},
+        "min_bitrate":  VBR_MIN_BITRATE,
+        # Opus and Vorbis reach transparency far below where MP3 does, so
+        # holding them to an MP3 number would flag good files as poor ones.
+        "codec_min_bitrate": {"opus": 128_000, "vorbis": 160_000},
+        "sample_rates": {22050, 32000, 44100, 48000, 88200, 96000, 176400, 192000},
+        "channels":     None,
+        "duration_tolerance": None,
+        "spectral":     True,
+    },
 }
 DEFAULT_PROFILE = "ytmusic"
 
@@ -601,7 +620,7 @@ def probe_audio(path: Path) -> dict:
 # container, which is why it cannot see any of this.
 #
 # Honest about the limits: at a threshold conservative enough never to reject a
-# genuine 1960s master or vinyl rip, this catches <=192 kbps ancestry reliably and
+# genuine 1960s master or vinyl rip, this catches <=192 kbps MP3 ancestry and
 # does NOT catch 256 kbps AAC or 320 kbps Vorbis ancestry (AAC has no consistent
 # brickwall, and HE-AAC synthesises highs so the file looks full-band). This is a
 # filter for egregious fraud, not a proof of losslessness.
@@ -622,8 +641,15 @@ SPECTRAL_NOISY_TAIL_DB   = -60.0  # noise above the ceiling => real band-limited
 # Lowpass frequencies real encoders use. A measured cutoff that matches none of
 # these is a band-limited *source* (old master, vinyl, spoken word), not a
 # transcode — cheap and high-value discrimination.
-CANONICAL_CUTOFFS_HZ = (16000, 17000, 17500, 18500, 18600, 19000,
-                        19400, 19500, 19700, 20000, 20500)
+# LAME's lowpass by bitrate, plus the values other encoders settle on. The low
+# end matters most and was missing entirely: nothing here sat below 16 kHz, so a
+# 96 kbps ancestor (~15.1 kHz) matched no entry, and because `strong` requires a
+# canonical match, the most egregious transcodes were the ones that got waved
+# through. Verified against a real 96k->FLAC upscale, which measures 15258 Hz
+# with a 79 dB cliff and nothing above it.
+CANONICAL_CUTOFFS_HZ = (10900, 13000, 15100, 15400, 16000, 16900, 17000, 17500,
+                        18000, 18500, 18600, 19000, 19400, 19500, 19700, 20000,
+                        20500)
 CANONICAL_TOLERANCE_HZ = 300
 
 # Enforcement is opt-in. Ship in log-only mode, review what it *would* have
@@ -911,7 +937,8 @@ def verify_download(
         if bit_rate is None:
             return "PROBE_FAILED", {**probe, "error": "bit rate could not be determined"}
         probe["measured_bitrate"] = bit_rate
-        if bit_rate < rules["min_bitrate"]:
+        floor = (rules.get("codec_min_bitrate") or {}).get(codec, rules["min_bitrate"])
+        if bit_rate < floor:
             return "LOW_BITRATE", probe
 
     try:
@@ -932,18 +959,24 @@ def verify_download(
     # The duration check is what catches wrong recordings — a remaster, radio
     # edit, live take or sped-up re-upload downloads at full 256k and tags
     # correctly, so every check above passes.
-    if expected_duration_s is None:
-        return "NO_SPOTIFY_DURATION", {
-            **probe,
-            "error": "no Spotify duration available for this track",
-        }
-    try:
-        actual = float(probe["format"]["duration"])
-    except (KeyError, TypeError, ValueError):
-        return "PROBE_FAILED", {**probe, "error": "format duration missing or unparseable"}
+    # A profile with no duration_tolerance never had a reference to compare
+    # against, so there is nothing to check here and nothing has gone wrong.
+    # Profiles that DO expect one still fail without it: for a playlist track a
+    # missing duration means the wrong recording could pass unnoticed.
+    tolerance = rules["duration_tolerance"]
+    if tolerance is not None:
+        if expected_duration_s is None:
+            return "NO_SPOTIFY_DURATION", {
+                **probe,
+                "error": "no Spotify duration available for this track",
+            }
+        try:
+            actual = float(probe["format"]["duration"])
+        except (KeyError, TypeError, ValueError):
+            return "PROBE_FAILED", {**probe, "error": "format duration missing or unparseable"}
 
-    if abs(actual - expected_duration_s) > rules["duration_tolerance"]:
-        return "DURATION_MISMATCH", probe
+        if abs(actual - expected_duration_s) > tolerance:
+            return "DURATION_MISMATCH", probe
 
     # Last, because it is the only expensive check — decode plus STFT.
     if rules.get("spectral"):

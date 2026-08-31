@@ -167,6 +167,10 @@
   .q-ok  { background:rgba(78,205,196,.14); color:var(--teal); border:1px solid rgba(78,205,196,.35); }
   .q-bad { background:rgba(233,69,96,.13); color:var(--accent2); border:1px solid rgba(233,69,96,.4); }
   .q-unknown { background:#1e2a40; color:var(--muted); border:1px solid #2a3a50; }
+  /* Passed every metadata check, but the spectral pass thinks the audio was
+     re-encoded up from something worse. Not a failure — but not a clean pass
+     either, and it is the one thing ffprobe cannot tell you. */
+  .q-warn { background:rgba(230,160,60,.13); color:#e6a03c; border:1px solid rgba(230,160,60,.4); }
   .q-reason { font-size:.66rem; opacity:.85; font-weight:600; }
   .q-accepted { background:rgba(78,205,196,.10); color:var(--teal); border:1px solid rgba(78,205,196,.28); }
   .q-keep { margin-left:.35rem; padding:.16rem .45rem; border-radius:5px; font-size:.68rem;
@@ -699,9 +703,9 @@ function renderQuality(q) {
   // Never went through verification (predates it, or added by hand): show the
   // facts without a verdict rather than implying one.
   if (q.verified === false) {
-    return `<span class="q-badge q-unknown" title="Measured but never verified `
-         + `— downloaded before quality checks existed, or added manually">`
-         + `${esc(label)}</span>`;
+    return `<span class="q-badge q-unknown" title="Measured but not yet judged `
+         + `— either the deep check has not run on it yet, or it predates `
+         + `quality checks entirely">${esc(label)}</span>`;
   }
 
   if (q.ok) {
@@ -710,11 +714,15 @@ function renderQuality(q) {
     const kind = q.lossless
       ? 'Lossless — bitrate is informational, the floor does not apply'
       : 'Passed all checks';
-    const note = q.spectral === 'suspect'
-      ? ' · spectral check flagged this as possibly re-encoded' : '';
-    const tag = q.lossless ? ' lossless' : '';
-    return `<span class="q-badge q-ok" title="${kind}${note}">${esc(label)}`
-         + `${tag ? `<span class="q-reason">${tag.trim()}</span>` : ''}</span>`;
+    // A suspected transcode gets its own colour and its own word. Burying it in
+    // a tooltip on a green badge hides the single most useful thing the deep
+    // analysis found: a file that looks fine in every field and still is not.
+    const suspect = q.spectral === 'suspect';
+    const note = suspect
+      ? ` · re-encoded from a lower bitrate? ${q.spectral_detail || ''}` : '';
+    const tag = suspect ? 'transcode?' : (q.lossless ? 'lossless' : '');
+    return `<span class="q-badge ${suspect ? 'q-warn' : 'q-ok'}" title="${esc(kind + note)}">${esc(label)}`
+         + `${tag ? `<span class="q-reason">${esc(tag)}</span>` : ''}</span>`;
   }
   const why = QUALITY_REASONS[q.reason] || q.reason || 'failed verification';
   return `<span class="q-badge q-bad" title="${esc(why)}">${esc(label)}`
