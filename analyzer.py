@@ -349,6 +349,84 @@ def _fetch_track_metadata(url: str, staging_dir: Path) -> list[dict]:
     return [s for s in songs if s.get("song_id") and s.get("duration")]
 
 
+# ── accepting YouTube links ───────────────────────────────────────────────────
+# spotdl understands YouTube *Music* links but not plain YouTube ones: a
+# www.youtube.com or youtu.be URL falls through its query parser to the final
+# else branch, which does a Spotify *text search* for the URL itself and returns
+# whatever it makes of that. Rewriting to the music.youtube.com form is all that
+# is needed — it is the same video either way.
+#
+# Stripping the extra query parameters matters just as much. spotdl reads the
+# video id with request.split("?v=", 1)[1], so a link copied from the browser —
+# which routinely carries &list=RDAMVM... or &t=42s — hands it "ID&list=RDAMVM"
+# as the id and the lookup fails. That breaks even for music.youtube.com links,
+# so those get normalised too rather than passed through.
+_YT_HOSTS = r"(?:www\.|m\.|music\.)?youtube\.com"
+_YT_WATCH_RE  = re.compile(rf"^https?://{_YT_HOSTS}/watch\?(?P<query>.+)$", re.I)
+_YT_SHORT_RE  = re.compile(r"^https?://youtu\.be/(?P<id>[\w-]+)(?:\?(?P<query>.*))?$", re.I)
+_YT_SHORTS_RE = re.compile(rf"^https?://{_YT_HOSTS}/shorts/(?P<id>[\w-]+)", re.I)
+_YT_LIST_RE   = re.compile(rf"^https?://{_YT_HOSTS}/(?:playlist\?(?P<query>.+)|browse/(?P<browse>VLPL[\w-]+))$", re.I)
+
+
+def _query_param(query: str, name: str) -> str | None:
+    from urllib.parse import parse_qs
+    values = parse_qs(query or "").get(name) or []
+    return values[0] if values else None
+
+
+def normalise_source_url(url: str) -> tuple[str, str | None]:
+    """Rewrite a YouTube link into the form spotdl actually understands.
+
+    Returns (url, note); note is None when nothing was rewritten and otherwise
+    explains the change for the run log, because silently downloading something
+    other than what was pasted would be worse than not accepting it at all.
+
+    Spotify URLs and anything unrecognised are returned untouched — spotdl has
+    its own handling for those and guessing on top of it would only get in the
+    way.
+    """
+    url = (url or "").strip()
+
+    matched = _YT_SHORT_RE.match(url) or _YT_SHORTS_RE.match(url)
+    if matched:
+        video = matched.group("id")
+        return (f"https://music.youtube.com/watch?v={video}",
+                f"treating {url} as YouTube Music track {video}")
+
+    matched = _YT_WATCH_RE.match(url)
+    if matched:
+        query = matched.group("query")
+        video = _query_param(query, "v")
+        if video:
+            canonical = f"https://music.youtube.com/watch?v={video}"
+            if canonical == url:
+                return url, None
+            extra = " (ignoring the playlist and timestamp it carried)" if (
+                _query_param(query, "list") or _query_param(query, "t")) else ""
+            return canonical, f"reading {url} as YouTube Music track {video}{extra}"
+        # A watch link with no v= is a playlist in disguise.
+        playlist = _query_param(query, "list")
+        if playlist:
+            return (f"https://music.youtube.com/playlist?list={playlist}",
+                    f"reading {url} as YouTube Music playlist {playlist}")
+        return url, None
+
+    matched = _YT_LIST_RE.match(url)
+    if matched:
+        if matched.group("browse"):
+            canonical = f"https://music.youtube.com/browse/{matched.group('browse')}"
+        else:
+            playlist = _query_param(matched.group("query"), "list")
+            if not playlist:
+                return url, None
+            canonical = f"https://music.youtube.com/playlist?list={playlist}"
+        if canonical == url:
+            return url, None
+        return canonical, f"reading {url} as YouTube Music playlist"
+
+    return url, None
+
+
 def _display_name(song: dict) -> str:
     artist = song.get("artist") or (song.get("artists") or [""])[0]
     return f"{artist} - {song.get('name', '')}".strip(" -")
@@ -585,6 +663,10 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
             f"{settings.ENV_VARS['soulseek']}=1."
         )
 
+    url, note = normalise_source_url(url)
+    if note:
+        log(f"  {note}")
+
     _ensure_ffmpeg(log)
     download_dir.mkdir(parents=True, exist_ok=True)
     staging_dir    = download_dir / STAGING_DIRNAME
@@ -596,6 +678,20 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     log("Reading Spotify track metadata ...")
     songs = _fetch_track_metadata(url, staging_dir)
     log(f"Got Spotify durations for {len(songs)} track(s).")
+
+    # Downloading nothing and reporting "0 tracks" tells you what happened but
+    # not why, and for a YouTube link the why is usually the same thing.
+    if not songs:
+        raise quality.QualityGateError(
+            f"No tracks could be resolved from {url}.\n"
+            "Tracks are identified through Spotify — that is where the duration "
+            "each download is checked against comes from. A YouTube video with "
+            "no match in Spotify's catalogue (a DJ set, a bootleg edit, a "
+            "fan upload) therefore cannot be resolved this way.\n"
+            "For those, download the file yourself and use Import files in the "
+            "library: imported files are checked on everything measurable and "
+            "kept regardless."
+        )
 
     # The archive holds the Spotify URLs of tracks already verified and in the
     # library, so they aren't re-downloaded.  Quarantined tracks stay out of it
