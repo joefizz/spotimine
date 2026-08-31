@@ -121,19 +121,12 @@ _DOWNLOADED_WRAP_RE = re.compile(r'Downloaded "(?P<name>.+)":\s*$')
 _URL_ONLY_RE        = re.compile(r"^(?P<url>https?://\S+)$")
 
 
-# Windows rejects these outright and they are landmines everywhere else.  The
-# spotdl path gets sanitisation for free from create_file_name; anything we name
-# ourselves — every Soulseek result — has to do it here, or os.replace raises an
-# OSError that nothing catches and the whole run dies on one awkward title.
-_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-
-def _safe_filename(name: str) -> str:
-    """A filename that will not be rejected by the filesystem."""
-    # Trailing dots and spaces are silently stripped by Windows, which would make
-    # the name we record differ from the name on disk.
-    cleaned = _ILLEGAL_NAME_CHARS.sub("_", name).strip().rstrip(" .")
-    return cleaned or "untitled"
+# The spotdl path gets sanitisation for free from create_file_name; anything
+# we name ourselves — every Soulseek result, every imported file — has to do
+# it explicitly, or os.replace raises an OSError nothing catches and the run
+# dies on one awkward title.  It lives in quality.py so the web layer can use
+# it too without importing this module and its matplotlib/librosa weight.
+_safe_filename = quality.safe_filename
 
 
 def _unique_path(path: Path) -> Path:
@@ -1044,17 +1037,29 @@ def run_analysis(url: str, songs_dir: Path, reports_dir: Path, log: LogFn = prin
         log("No audio files found after download.")
         return
 
+    analyze_files(audio_files, reports_dir, log)
+
+
+def analyze_files(paths: list[Path], reports_dir: Path, log: LogFn = print) -> int:
+    """Chart every one of these files that has not been charted yet.
+
+    Returns how many charts were produced.  Shared by the playlist run and by
+    files imported from your own machine: a track is a track, and where it came
+    from changes nothing about how it is analysed.
+    """
+    reports_dir.mkdir(parents=True, exist_ok=True)
     analyzed = _read_analyzed_tracks(reports_dir)
-    new_tracks = [f for f in audio_files if f.name not in analyzed]
-    skip_count = len(audio_files) - len(new_tracks)
+    new_tracks = [f for f in paths if f.name not in analyzed]
+    skip_count = len(paths) - len(new_tracks)
 
     if skip_count > 0:
         log(f"Skipping {skip_count} already-analyzed track(s).")
 
     if not new_tracks:
         log("All tracks already analyzed.")
-        return
+        return 0
 
+    done = 0
     log(f"\nAnalyzing {len(new_tracks)} new track(s) ...")
     for path in new_tracks:
         log(f"  Analyzing: {path.name}")
@@ -1064,8 +1069,10 @@ def run_analysis(url: str, songs_dir: Path, reports_dir: Path, log: LogFn = prin
             generate_chart(data, out)
             _mark_analyzed(reports_dir, path.name, data)
             log(f"  ✓ {data['name']}  ({data['tempo']:.1f} BPM, key {data['key']})")
+            done += 1
         except Exception as exc:
             log(f"  ✗ {path.name}: {exc}")
+    return done
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────

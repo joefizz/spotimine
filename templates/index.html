@@ -115,26 +115,43 @@
   .btn-danger { background:transparent; border:1px solid #5a1020; color:#c03050; padding:.38rem .9rem; font-size:.78rem; font-weight:600; margin-left:auto; }
   .btn-danger:hover { background:#2a0d14; border-color:var(--accent); color:var(--accent); }
 
-  /* ── songs table ── */
+  /* Sorting used to live in the table headers, which no longer have a column
+     each. Chips also fix a quiet bug: sorting by Quality never showed an
+     indicator, because the header-index map had no entry for it. */
+  .sort-bar { display:flex; flex-wrap:wrap; align-items:center; gap:.4rem; margin-bottom:.9rem; }
+  .sort-bar-label { font-size:.72rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; margin-right:.2rem; }
+  .sort-chip { background:transparent; border:1px solid var(--surf2); color:var(--muted); border-radius:20px;
+               padding:.24rem .7rem; font-size:.76rem; font-weight:600; cursor:pointer; transition:color .15s,border-color .15s; }
+  .sort-chip:hover { border-color:var(--accent); color:var(--accent); background:transparent; }
+  .sort-chip.active { border-color:var(--accent); color:var(--accent); background:rgba(233,69,96,.1); }
+  .sort-chip .sort-indicator { font-size:.62rem; margin-left:.25rem; opacity:1; }
+
+  /* Import from this computer. */
+  #songs-section.drop-active { outline:2px dashed var(--teal); outline-offset:8px; border-radius:var(--r); }
+
   section { margin-bottom:2.5rem; }
-  /* Every cell in this table is nowrap, so the table's minimum width is the sum
-     of its columns and it will happily render wider than the column it sits in —
-     sliding under the class builder rather than shrinking. min-width:0 on the
-     flex parent lets the *panel* shrink but does nothing for the table inside
-     it, so the table needs its own scroll container. This also holds when the
-     divider is dragged left or a narrow split is restored from localStorage. */
-  .table-scroll { max-width:100%; overflow-x:auto; }
-  .songs-table { width:100%; border-collapse:collapse; }
-  .songs-table th { text-align:left; font-size:.74rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; padding:.6rem .9rem; border-bottom:1px solid var(--surf2); white-space:nowrap; cursor:pointer; user-select:none; transition:color .15s; }
-  .songs-table th:hover { color:var(--accent); }
-  .songs-table th.active { color:var(--accent); }
-  .sort-indicator { font-size:.65rem; opacity:0; transition:opacity .15s; }
-  .songs-table th.active .sort-indicator { opacity:1; }
+  /* Three columns, not eight. Eight nowrap columns could not fit this panel at
+     any sensible width - the table's minimum width was the sum of them all, so
+     it rendered wider than its container and slid under the class builder.
+     min-width:0 on the flex parent lets the *panel* shrink but does nothing for
+     the table inside it. The per-track detail now sits on a second line within
+     the first cell, and nothing is nowrap, so a row reflows downwards instead
+     of demanding a horizontal scrollbar. */
+  .table-scroll { max-width:100%; }
+  .songs-table { width:100%; border-collapse:collapse; table-layout:fixed; }
+  .songs-table col.col-tags    { width:30%; }
+  .songs-table col.col-actions { width:130px; }
+  .songs-table th { text-align:left; font-size:.74rem; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.8px; padding:.6rem .9rem; border-bottom:1px solid var(--surf2); user-select:none; }
   .songs-table td { padding:.6rem .9rem; border-bottom:1px solid #1e2a40; font-size:.87rem; vertical-align:middle; }
   .songs-table tr:hover td { background:rgba(255,255,255,.02); }
-  .song-name { font-weight:600; max-width:260px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .cell-muted { color:var(--muted); white-space:nowrap; }
-  .cell-actions { display:flex; gap:.4rem; white-space:nowrap; }
+  .cell-track { min-width:0; }
+  /* Wrap, never truncate: a long name takes a second line rather than being
+     cut off or widening the column. */
+  .track-title { font-weight:600; overflow-wrap:anywhere; line-height:1.35; }
+  .track-meta { display:flex; flex-wrap:wrap; align-items:center; gap:.3rem .5rem; margin-top:.3rem; }
+  .track-meta .tm { color:var(--muted); font-size:.76rem; font-weight:600; white-space:nowrap; }
+  .cell-muted { color:var(--muted); }
+  .cell-actions { display:flex; flex-wrap:wrap; gap:.35rem; align-content:flex-start; }
   .btn-sm { padding:.28rem .58rem; font-size:.76rem; font-weight:700; border-radius:5px; }
   .btn-play { background:var(--teal); color:#0d1a1a; }
   .btn-play:hover { background:#3ab5ad; }
@@ -146,8 +163,7 @@
   .empty-row td { color:var(--muted); font-style:italic; text-align:center; padding:2rem; }
 
   /* ── quality badge ── */
-  .cell-quality { white-space:nowrap; }
-  .q-badge { display:inline-flex; align-items:center; gap:.35rem; padding:.18rem .5rem; border-radius:5px; font-size:.74rem; font-weight:700; letter-spacing:.3px; cursor:help; }
+  .q-badge { white-space:nowrap; display:inline-flex; align-items:center; gap:.35rem; padding:.18rem .5rem; border-radius:5px; font-size:.74rem; font-weight:700; letter-spacing:.3px; cursor:help; }
   .q-ok  { background:rgba(78,205,196,.14); color:var(--teal); border:1px solid rgba(78,205,196,.35); }
   .q-bad { background:rgba(233,69,96,.13); color:var(--accent2); border:1px solid rgba(233,69,96,.4); }
   .q-unknown { background:#1e2a40; color:var(--muted); border:1px solid #2a3a50; }
@@ -161,7 +177,7 @@
                background:rgba(78,205,196,.12); }
 
   /* ── tags in table ── */
-  .tags-cell { display:flex; flex-wrap:wrap; gap:.3rem; align-items:center; min-width:160px; }
+  .tags-cell { display:flex; flex-wrap:wrap; gap:.3rem; align-items:center; }
   .tag-chip { display:inline-flex; align-items:center; gap:.3rem; padding:.18rem .52rem; border-radius:20px; font-size:.72rem; font-weight:700; letter-spacing:.3px; cursor:default; }
   .tag-edit-btn { background:transparent; border:1px dashed var(--surf2); color:var(--muted); border-radius:20px; padding:.18rem .52rem; font-size:.72rem; cursor:pointer; font-weight:600; }
   .tag-edit-btn:hover { border-color:var(--accent); color:var(--accent); background:transparent; }
@@ -379,24 +395,33 @@
         <div class="sec-head">
           <h2>Songs Library</h2>
           <span class="badge" id="songs-count">0</span>
-          <button class="btn-danger" onclick="confirmPurge()">Purge All</button>
+          <button class="btn-ghost" onclick="document.getElementById('import-input').click()"
+                  title="Copy audio files from this computer into the library">Import files</button>
+          <button class="btn-danger" style="margin-left:0" onclick="confirmPurge()">Purge All</button>
+          <input type="file" id="import-input" multiple style="display:none"
+                 accept="audio/*,.mp3,.m4a,.flac,.wav,.opus"
+                 onchange="importFiles(this.files); this.value='';">
         </div>
+
+        <div class="sort-bar">
+          <span class="sort-bar-label">Sort by</span>
+          <button class="sort-chip" data-sort="name"     onclick="toggleSort('name')">Name<span class="sort-indicator"></span></button>
+          <button class="sort-chip" data-sort="tempo"    onclick="toggleSort('tempo')">BPM<span class="sort-indicator"></span></button>
+          <button class="sort-chip" data-sort="key"      onclick="toggleSort('key')">Key<span class="sort-indicator"></span></button>
+          <button class="sort-chip" data-sort="duration" onclick="toggleSort('duration')">Duration<span class="sort-indicator"></span></button>
+          <button class="sort-chip" data-sort="bitrate"  onclick="toggleSort('bitrate')">Quality<span class="sort-indicator"></span></button>
+        </div>
+
         <div class="table-scroll">
         <table class="songs-table">
+          <colgroup>
+            <col><col class="col-tags"><col class="col-actions">
+          </colgroup>
           <thead>
-            <tr>
-              <th onclick="toggleSort('name')">Song <span class="sort-indicator"></span></th>
-              <th onclick="toggleSort('tempo')">BPM <span class="sort-indicator"></span></th>
-              <th onclick="toggleSort('key')">Key <span class="sort-indicator"></span></th>
-              <th onclick="toggleSort('duration')">Duration <span class="sort-indicator"></span></th>
-              <th onclick="toggleSort('bitrate')">Quality <span class="sort-indicator"></span></th>
-              <th>Tags</th>
-              <th>Class</th>
-              <th>Actions</th>
-            </tr>
+            <tr><th>Track</th><th>Tags</th><th>Actions</th></tr>
           </thead>
           <tbody id="songs-tbody">
-            <tr class="empty-row"><td colspan="8">No songs downloaded yet.</td></tr>
+            <tr class="empty-row"><td colspan="3">No songs yet. Analyze a playlist above, or drop audio files here to import them.</td></tr>
           </tbody>
         </table>
         </div>
@@ -530,6 +555,7 @@ const audio   = document.getElementById('audio');
 // ── Boot ──────────────────────────────────────────────────────────────────────
 window.addEventListener('load', () => {
   loadAll();
+  setUpImportDropZone();
   refreshSourceStatus();
   refreshCookieStatus();
   refreshSlskStatus();
@@ -579,7 +605,7 @@ function renderSongs(songs) {
   const tbody = document.getElementById('songs-tbody');
   document.getElementById('songs-count').textContent = songs.length;
   if (!songs.length) {
-    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No songs downloaded yet.</td></tr>';
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="3">No songs yet. Analyze a playlist above, or drop audio files here to import them.</td></tr>';
     return;
   }
 
@@ -591,11 +617,15 @@ function renderSongs(songs) {
 
   tbody.innerHTML = displaySongs.map(s => `
     <tr data-file="${esc(s.file)}">
-      <td class="song-name" title="${esc(s.name)}">${esc(s.name)}</td>
-      <td class="cell-muted">${s.tempo ? s.tempo.toFixed(1) : '—'}</td>
-      <td class="cell-muted">${s.key || '—'}</td>
-      <td class="cell-muted">${s.duration ? fmtTime(s.duration) : '—'}</td>
-      <td class="cell-quality">${renderQuality(s.quality)}${renderKeepToggle(s)}</td>
+      <td class="cell-track">
+        <div class="track-title" title="${esc(s.name)}">${esc(s.name)}</div>
+        <div class="track-meta">
+          ${s.tempo ? `<span class="tm">${s.tempo.toFixed(1)} BPM</span>` : ''}
+          ${s.key ? `<span class="tm">${esc(s.key)}</span>` : ''}
+          ${s.duration ? `<span class="tm">${fmtTime(s.duration)}</span>` : ''}
+          ${renderQuality(s.quality)}${renderKeepToggle(s)}
+        </div>
+      </td>
       <td>
         <div class="tags-cell" id="tags-${esc(s.file)}">
           ${renderTagChips(s.tags || [])}
@@ -604,21 +634,20 @@ function renderSongs(songs) {
             title="Edit tags">＋ tag</button>
         </div>
       </td>
-      <td>
-        <button class="btn-sm btn-add" onclick="addToPlaylist('${jsEsc(s.file)}')" title="Add to class playlist">+ Class</button>
-      </td>
       <td class="cell-actions">
         <button class="btn-sm btn-play"
           data-chart="${esc(s.chart_file||'')}"
           data-audio="${esc(s.file)}"
           data-name="${esc(s.name)}"
           data-dur="${s.duration||0}"
-          onclick="openPlayerFromEl(this)">▶</button>
+          onclick="openPlayerFromEl(this)" title="Play">▶</button>
         <a class="btn-sm btn-dl"
           href="/songs/download/${encodeURIComponent(s.file)}"
-          download="${esc(s.file)}">⬇</a>
+          download="${esc(s.file)}" title="Download">⬇</a>
         <button class="btn-sm btn-del"
-          onclick="deleteSong('${jsEsc(s.file)}')">✕</button>
+          onclick="deleteSong('${jsEsc(s.file)}')" title="Delete">✕</button>
+        <button class="btn-sm btn-add" onclick="addToPlaylist('${jsEsc(s.file)}')"
+          title="Add to class playlist">+ Class</button>
       </td>
     </tr>
   `).join('');
@@ -707,20 +736,15 @@ function toggleSort(column) {
     sortState.ascending = true;
   }
 
-  // Update header styles
-  document.querySelectorAll('.songs-table th').forEach(th => {
-    th.classList.remove('active');
-    const indicator = th.querySelector('.sort-indicator');
-    if (indicator) indicator.textContent = '';
+  // Mark the active chip. Driving this off data-sort rather than a column index
+  // means every sortable field gets an indicator, including Quality, which the
+  // old index map silently left out.
+  document.querySelectorAll('.sort-chip').forEach(chip => {
+    const on = chip.dataset.sort === sortState.column;
+    chip.classList.toggle('active', on);
+    const indicator = chip.querySelector('.sort-indicator');
+    if (indicator) indicator.textContent = on ? (sortState.ascending ? ' ▲' : ' ▼') : '';
   });
-
-  const headers = document.querySelectorAll('.songs-table th');
-  const columnIndex = { 'name': 0, 'tempo': 1, 'key': 2, 'duration': 3 }[column];
-  if (columnIndex !== undefined && headers[columnIndex]) {
-    headers[columnIndex].classList.add('active');
-    const indicator = headers[columnIndex].querySelector('.sort-indicator');
-    if (indicator) indicator.textContent = sortState.ascending ? '▲' : '▼';
-  }
 
   renderSongs(allSongs);
 }
@@ -914,31 +938,115 @@ function startAnalysis() {
   .then(({job_id, error}) => {
     if (error) { setStatus('error', error); btn.disabled = false; return; }
     setStatus('running', 'Downloading…');
-    if (currentES) currentES.close();
-    const es = new EventSource(`/stream/${job_id}`);
-    currentES = es;
-    es.onmessage = e => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'log') {
-        appendLog(msg.msg);
-        if (msg.msg.includes('Analyzing')) setStatus('running', msg.msg.trim());
-      } else if (msg.type === 'done') {
-        setStatus('done', `Done — ${msg.charts.length} chart(s) generated`);
-        btn.disabled = false;
-        allCharts = msg.charts;
-        renderCharts(msg.charts);
-        loadAll();
-        es.close();
-      } else if (msg.type === 'error') {
-        appendLog('ERROR: ' + msg.msg, 'err');
-        setStatus('error', 'Failed — see log above');
-        btn.disabled = false;
-        es.close();
-      }
-    };
-    es.onerror = () => { setStatus('error', 'Connection lost'); btn.disabled = false; es.close(); };
+    followJob(job_id, {
+      onDone:  msg => { setStatus('done', `Done — ${msg.charts.length} chart(s) generated`); btn.disabled = false; },
+      onError: ()  => { btn.disabled = false; },
+    });
   })
   .catch(err => { setStatus('error', String(err)); btn.disabled = false; });
+}
+
+// Follow a background job's log stream. Both the playlist run and an import
+// produce charts, so the only thing that differs between them is what to say
+// when it finishes.
+function followJob(jobId, { onDone, onError } = {}) {
+  if (currentES) currentES.close();
+  const es = new EventSource(`/stream/${jobId}`);
+  currentES = es;
+  es.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'log') {
+      appendLog(msg.msg);
+      if (msg.msg.includes('Analyzing')) setStatus('running', msg.msg.trim());
+    } else if (msg.type === 'done') {
+      allCharts = msg.charts;
+      renderCharts(msg.charts);
+      loadAll();
+      es.close();
+      if (onDone) onDone(msg);
+    } else if (msg.type === 'error') {
+      appendLog('ERROR: ' + msg.msg, 'err');
+      setStatus('error', 'Failed — see log above');
+      es.close();
+      if (onError) onError(msg);
+    }
+  };
+  es.onerror = () => {
+    setStatus('error', 'Connection lost');
+    es.close();
+    if (onError) onError();
+  };
+}
+
+// ── Import files from this computer ───────────────────────────────────────────
+// Imported files are accepted on arrival: you chose them deliberately, so no
+// download run may overwrite them. Charting happens in the background, because
+// it decodes the whole file.
+
+async function importFiles(fileList) {
+  const files = [...(fileList || [])];
+  if (!files.length) return;
+
+  const form = new FormData();
+  for (const f of files) form.append('files', f);
+
+  clearLog();
+  setStatus('running', `Uploading ${files.length} file(s)…`);
+  appendLog(`Importing ${files.length} file(s) from this computer …`);
+
+  let data;
+  try {
+    const res = await fetch('/songs/import', { method: 'POST', body: form });
+    data = await res.json();
+    if (!res.ok || !data.ok) {
+      appendLog('ERROR: ' + (data.error || `import failed (${res.status})`), 'err');
+      setStatus('error', 'Import failed — see log above');
+      return;
+    }
+  } catch (err) {
+    appendLog('ERROR: ' + String(err), 'err');
+    setStatus('error', 'Import failed');
+    return;
+  }
+
+  for (const skip of data.skipped || []) {
+    appendLog(`skipped ${skip.name} — ${skip.why}`, 'err');
+  }
+  for (const name of data.imported || []) appendLog(`✓ imported ${name}`);
+
+  loadAll();
+  if (!data.imported.length) {
+    setStatus('done', 'Nothing imported');
+    return;
+  }
+  setStatus('running', `Imported ${data.imported.length} — analyzing…`);
+  followJob(data.job_id, {
+    onDone: () => setStatus('done', `Imported and analyzed ${data.imported.length} file(s)`),
+  });
+}
+
+// Dropping files anywhere on the library counts as importing them.
+function setUpImportDropZone() {
+  const zone = document.getElementById('songs-section');
+  if (!zone) return;
+  const hasFiles = e => [...(e.dataTransfer?.types || [])].includes('Files');
+
+  zone.addEventListener('dragover', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    zone.classList.add('drop-active');
+  });
+  zone.addEventListener('dragleave', e => {
+    // Only clear when the pointer actually leaves the zone, not on every child.
+    if (e.relatedTarget && zone.contains(e.relatedTarget)) return;
+    zone.classList.remove('drop-active');
+  });
+  zone.addEventListener('drop', e => {
+    if (!hasFiles(e)) return;
+    e.preventDefault();
+    zone.classList.remove('drop-active');
+    importFiles(e.dataTransfer.files);
+  });
 }
 
 // ── Download sources ──────────────────────────────────────────────────────────

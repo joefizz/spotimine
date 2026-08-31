@@ -18,6 +18,7 @@ Can be run directly to check the gate without downloading anything:
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1004,6 +1005,20 @@ def quarantine_file(
 # erases every verdict recorded in the meantime.
 
 QUALITY_FILENAME = "quality.json"
+
+# Windows rejects these outright and they are landmines everywhere else. Any
+# name we build ourselves — a Soulseek result, an imported file — has to go
+# through this, or os.replace raises an OSError nothing catches.
+_ILLEGAL_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def safe_filename(name: str) -> str:
+    """A filename that will not be rejected by the filesystem."""
+    # Trailing dots and spaces are silently stripped by Windows, which would
+    # make the name we record differ from the name actually on disk.
+    cleaned = _ILLEGAL_NAME_CHARS.sub("_", name).strip().rstrip(" .")
+    return cleaned or "untitled"
+
 
 _records_lock = threading.Lock()
 

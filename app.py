@@ -269,6 +269,91 @@ def delete_song(filename: str):
     return jsonify({"ok": True})
 
 
+# Generous, because a lossless album is genuinely large: 40 FLAC tracks at
+# 40 MB each is 1.6 GB. Flask rejects anything over this with a 413, which the
+# handler below turns into a readable message rather than a bare error page.
+IMPORT_MAX_BYTES = 4 * 1024 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = IMPORT_MAX_BYTES
+
+
+@app.errorhandler(413)
+def _too_large(_exc):
+    limit = IMPORT_MAX_BYTES // (1024 ** 3)
+    return jsonify({
+        "ok": False,
+        "error": f"that upload is over the {limit} GB limit — import in smaller batches",
+    }), 413
+
+
+@app.route("/songs/import", methods=["POST"])
+def import_songs():
+    """Copy audio files from your own machine into the library.
+
+    Imported files are marked accepted straight away: you put them there
+    deliberately, so no download run may overwrite or replace them.  They are
+    measured like anything else but carry no pass/fail verdict — there is no
+    Spotify duration to judge them against, and inventing one would be worse
+    than admitting they were never checked.
+
+    A name that already exists is skipped rather than overwritten or silently
+    renamed: you are told, and you decide.
+    """
+    uploads = request.files.getlist("files")
+    if not uploads:
+        return jsonify({"ok": False, "error": "no files were sent"}), 400
+
+    imported: list[str] = []
+    skipped:  list[dict] = []
+
+    for item in uploads:
+        # Take only the bare name: browsers may send a relative path, and a
+        # crafted one must never reach outside the songs directory.
+        original = Path(item.filename or "").name
+        if not original:
+            continue
+
+        suffix = Path(original).suffix.lower()
+        if suffix not in AUDIO_EXTS:
+            skipped.append({"name": original,
+                            "why": f"{suffix or 'no extension'} is not an audio file"})
+            continue
+
+        dest = SONGS_DIR / f"{quality.safe_filename(Path(original).stem)}{suffix}"
+        if dest.exists():
+            skipped.append({"name": original, "why": "already in the library"})
+            continue
+
+        try:
+            item.save(dest)
+        except OSError as exc:
+            skipped.append({"name": original, "why": f"could not be saved: {exc}"})
+            continue
+        imported.append(dest.name)
+
+    job_id = None
+    if imported:
+        # Measure them, then accept them, in that order: set_accepted needs a
+        # record to attach the decision to.
+        _measure_unrecorded(_read_quality())
+        for name in imported:
+            quality.set_accepted(SONGS_DIR, name, True)
+
+        # Charting decodes the whole file, so it runs in the background on the
+        # same job plumbing the playlist run uses.
+        job_id = uuid.uuid4().hex[:8]
+        q: queue.Queue = queue.Queue()
+        with _jobs_lock:
+            _jobs[job_id] = q
+        threading.Thread(
+            target=_run_import_job,
+            args=(job_id, [SONGS_DIR / n for n in imported], q),
+            daemon=True,
+        ).start()
+
+    return jsonify({"ok": True, "imported": imported,
+                    "skipped": skipped, "job_id": job_id})
+
+
 @app.route("/songs/<path:filename>/accept", methods=["PUT"])
 def accept_song(filename: str):
     """Mark a file as one to keep, or withdraw that.
@@ -772,6 +857,24 @@ def _build_markdown(summary: dict, tracks: list) -> str:
 
 
 # ── job runner ────────────────────────────────────────────────────────────────
+
+def _run_import_job(job_id: str, paths: list, q: queue.Queue):
+    """Chart files that were just imported. No downloading is involved."""
+    from analyzer import analyze_files
+
+    def log(msg: str):
+        q.put({"type": "log", "msg": msg})
+
+    try:
+        log(f"Imported {len(paths)} file(s) into the library.")
+        log("These are kept as they are — accepted, so no run will replace them.")
+        analyze_files(paths, REPORTS_DIR, log)
+        q.put({"type": "done", "charts": _load_charts()})
+    except Exception as exc:
+        q.put({"type": "error", "msg": str(exc)})
+    finally:
+        q.put(None)
+
 
 def _run_job(job_id: str, url: str, q: queue.Queue):
     from analyzer import run_analysis
