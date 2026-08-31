@@ -1,0 +1,41 @@
+# Docker uploads this whole directory to the daemon before a build starts, and
+# re-hashes it on every rebuild. Unfiltered that is ~722 MB here, of which
+# ~672 MB is a virtualenv that is useless inside a Linux image (wrong platform,
+# and the image installs its own dependencies) and ~49 MB is songs and charts
+# that are bind-mounted at runtime anyway. On Docker Desktop that transfer
+# crosses a VM boundary, so it dominates the build time before a single
+# instruction runs.
+#
+# Allowlist, not denylist: deny everything, then re-admit what the image needs.
+# A denylist fails open — the next virtualenv, cache directory or credential
+# file silently rejoins the context and nobody notices until the build is slow
+# again or something leaks.
+*
+
+!*.py
+!requirements.txt
+!templates
+
+# Re-denied explicitly, after the allows, because these are the ones where a
+# mistake is expensive rather than merely slow. `COPY . .` was baking a live
+# YouTube Music Premium session and the Soulseek password into an image layer;
+# deleting them in a later step would not help, because layers are immutable
+# and anyone with the image can read them straight back out.
+.env
+.env.*
+cookies.txt
+.spotimine
+
+# Never useful in the image, and listed so the intent survives an edit to the
+# allowlist above.
+venv
+.venv
+__pycache__
+*.pyc
+.git
+.gitignore
+.gitattributes
+songs
+static
+Dockerfile
+docker-compose.yml
