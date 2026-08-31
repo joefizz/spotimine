@@ -539,6 +539,119 @@ def _ytmusic_pass(
     process.wait()
 
 
+# yt-dlp stages here, and files reach the library only after verification, the
+# same rule every other source follows. Separate from the spotdl staging so a
+# sweep of one never picks up the other's partial downloads.
+YOUTUBE_STAGING_DIRNAME = "staging-youtube"
+
+# itag 141 is the 256 kbps AAC stream Premium serves. The fallbacks exist so a
+# video that genuinely has nothing better still arrives rather than failing
+# outright — ffprobe measures what actually turned up, so a fallback cannot
+# smuggle something poor past you unnoticed; it lands in the library flagged.
+YOUTUBE_FORMAT = "141/bestaudio[ext=m4a]/bestaudio/best"
+
+YOUTUBE_TIMEOUT_S = int(os.environ.get("SPOTIMINE_YT_TIMEOUT", "1800"))
+
+# yt-dlp announces its choice as: [info] <id>: Downloading 1 format(s): 141
+_YTDLP_FORMAT_RE = re.compile(r"Downloading \d+ format\(s\):\s*(?P<fmt>\S+)")
+
+
+def is_youtube_url(url: str) -> bool:
+    """Whether this is a YouTube or YouTube Music link of any shape."""
+    return bool(_YT_WATCH_RE.match(url) or _YT_SHORT_RE.match(url)
+                or _YT_SHORTS_RE.match(url) or _YT_LIST_RE.match(url))
+
+
+def _youtube_pass(url: str, download_dir: Path, verifier: "_Verifier",
+                  log: LogFn) -> None:
+    """Download a YouTube link directly, with no Spotify lookup at all.
+
+    A YouTube link already names exactly what you want, so putting a Spotify
+    search in front of it only adds ways to fail: it can match the wrong
+    recording, and for a video with no catalogue equivalent — a DJ set, a
+    bootleg edit, a fan upload — it matches nothing and you get silence.
+    yt-dlp fetches the video itself using the same Premium cookies the gate has
+    just verified, so the stream is the same 256 kbps AAC the playlist path
+    targets.
+
+    Verification runs under the "local" profile: everything measurable is
+    judged, and only the duration comparison is skipped, because there is no
+    Spotify track to compare against.
+    """
+    staging = download_dir / YOUTUBE_STAGING_DIRNAME
+    staging.mkdir(parents=True, exist_ok=True)
+    before = set(_audio_files(staging, recursive=True))
+
+    argv = [
+        *quality._ytdlp_cmd(),
+        "--cookies", str(quality.COOKIE_FILE),
+        "-f", YOUTUBE_FORMAT,
+        # A watch link means that one track, not the fifty-song radio mix
+        # YouTube attaches to it.
+        "--yes-playlist" if _YT_LIST_RE.match(url) else "--no-playlist",
+        "--no-overwrites",
+        "--newline",
+        "--no-progress",
+        # artist/track are what YouTube Music supplies; uploader/title are the
+        # fallback for a plain YouTube video that carries no music metadata.
+        "-o", str(staging / "%(artist,uploader)s - %(track,title)s.%(ext)s"),
+        url,
+    ]
+
+    log("  Fetching with yt-dlp (no Spotify lookup) ...")
+    try:
+        process = subprocess.Popen(
+            argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+    except OSError as exc:
+        log(f"  Could not run yt-dlp: {exc}")
+        return
+
+    try:
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            log(f"    {line}")
+            # Saying "no fallbacks" and then quietly taking 128 kbps because
+            # itag 141 was not on offer is the exact failure this project
+            # exists to avoid. The file is still kept and flagged, but the
+            # reason is said out loud at the moment it happens.
+            chosen = _YTDLP_FORMAT_RE.search(line)
+            if chosen and chosen.group("fmt").split("-", 1)[0] != quality.PREMIUM_ITAG:
+                log(f"  ! itag {quality.PREMIUM_ITAG} (256 kbps AAC) was not "
+                    f"available — falling back to format {chosen.group('fmt')}. "
+                    "Usually an expired or non-Premium session.")
+        process.wait(timeout=YOUTUBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        log(f"  yt-dlp timed out after {YOUTUBE_TIMEOUT_S}s; keeping what arrived.")
+    finally:
+        if process.poll() is None:
+            process.kill()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            pass
+
+    # Sweep the directory rather than parse yt-dlp's output: a file on disk is
+    # the fact that matters, and it keeps this consistent with every other
+    # source here. Only files this run produced, so a previous partial download
+    # is not adopted as if it were fresh.
+    staged = [p for p in _audio_files(staging, recursive=True) if p not in before]
+    if not staged:
+        log("  yt-dlp produced no audio file.")
+        return
+
+    for path in staged:
+        display = path.stem
+        verifier.handle(
+            path, display, None, f"youtube:{url}",
+            download_dir / f"{_safe_filename(display)}{path.suffix}",
+            profile="local", track_streak=False,
+        )
+
+
 def _norm(text: str) -> str:
     """Lowercase alphanumerics only — enough to compare names across sources."""
     return re.sub(r"[^a-z0-9]+", "", (text or "").casefold())
@@ -674,6 +787,38 @@ def download_playlist(url: str, download_dir: Path, log: LogFn = print) -> list[
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     log(f"Download sources enabled: {settings.describe_enabled()}")
+
+    # A YouTube link is unambiguous about what you want, so it goes straight to
+    # yt-dlp. Everything below this point exists to resolve Spotify metadata and
+    # match it to a source, which is work a YouTube link has already done — and
+    # work that fails outright for a video with no Spotify equivalent.
+    if is_youtube_url(url):
+        if not settings.is_enabled("ytmusic"):
+            raise quality.QualityGateError(
+                "That is a YouTube link, but the YouTube Music source is "
+                "switched off, so there is nothing to fetch it with.\n"
+                "Enable YouTube Music in the app and try again."
+            )
+        log("YouTube link — downloading it directly, no Spotify lookup needed.")
+        verifier = _Verifier(download_dir, quarantine_dir, log)
+        _youtube_pass(url, download_dir, verifier, log)
+
+        log("\n── Download summary ─────────────────────────────")
+        log(f"  {len(verifier.promoted)} file(s) in library from YouTube")
+        if verifier.flagged:
+            log(f"  Kept but flagged: {len(verifier.flagged)}")
+            for name, reason in verifier.flagged:
+                log(f"    • {name}  [{reason}]")
+            log("  Nothing here was deleted. Accept any of them in the library "
+                "to stop it being re-downloaded and replaced.")
+        if not verifier.promoted:
+            raise quality.QualityGateError(
+                f"Nothing could be downloaded from {url}.\n"
+                "The yt-dlp output above says why. A private, region-blocked or "
+                "removed video is the usual cause; an expired Premium session "
+                "is the other."
+            )
+        return verifier.promoted
 
     log("Reading Spotify track metadata ...")
     songs = _fetch_track_metadata(url, staging_dir)

@@ -595,11 +595,18 @@ def ensure_premium_access(log: LogFn = print) -> None:
 
 def probe_audio(path: Path) -> dict:
     """Run ffprobe over a file. Raises RuntimeError if it cannot be read."""
-    proc = subprocess.run(
-        ["ffprobe", *FFPROBE_ARGS, str(path)],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            ["ffprobe", *FFPROBE_ARGS, str(path)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        # A missing ffprobe raises FileNotFoundError, which is an OSError and
+        # not the RuntimeError this function documents. Letting it escape kills
+        # the whole run from inside verify_download, which catches RuntimeError
+        # only — one absent binary and every remaining track is lost.
+        raise RuntimeError(f"could not run ffprobe: {exc}") from exc
     if proc.returncode != 0:
         raise RuntimeError(
             (proc.stderr or "").strip() or f"ffprobe exited {proc.returncode}"
